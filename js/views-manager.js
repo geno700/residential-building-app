@@ -27,11 +27,14 @@ const numberInput = (value, onInput, extra = {}) =>
 // ---------------------------------------------------------------- first building
 
 export function CreateBuilding({ onDone, onCancel }) {
-  const [f, setF] = useState({ name: '', floors: '11', perFloor: '2', fee: '120', currency: 'EGP' });
+  const [f, setF] = useState({ name: '', floors: '11', perFloor: '2', fee: '120', currency: 'EGP', coded: 'yes' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const set = (k) => (v) => setF({ ...f, [k]: v });
   const total = (Number(f.floors) || 0) * (Number(f.perFloor) || 0);
+  // The same naming rule as the database: F1 / F1-R, F1-L / F1-1, F1-2 ...
+  const per = Number(f.perFloor) || 0;
+  const example = per <= 1 ? 'F1, F2, F3 …' : per === 2 ? 'F1-R, F1-L, F2-R …' : 'F1-1, F1-2, F1-3 …';
 
   async function submit(e) {
     e.preventDefault();
@@ -40,6 +43,7 @@ export function CreateBuilding({ onDone, onCancel }) {
     try {
       const res = await db.createBuilding({
         name: f.name, floors: Number(f.floors), perFloor: Number(f.perFloor), fee: Number(f.fee), currency: f.currency,
+        coded: f.coded === 'yes',
       });
       remember(CURRENT_KEY, res.building.id);
       onDone(res);
@@ -63,6 +67,13 @@ export function CreateBuilding({ onDone, onCancel }) {
         <label><span>${t('monthly_fee')}</span>${numberInput(f.fee, set('fee'), { required: true })}</label>
         <label><span>${t('currency')}</span><input maxlength="8" value=${f.currency} onInput=${(e) => set('currency')(e.target.value)} /></label>
       </div>
+      <label>
+        <span>${t('numbering')}</span>
+        <select value=${f.coded} onChange=${(e) => set('coded')(e.target.value)}>
+          <option value="yes">${t('numbering_coded', { x: example })}</option>
+          <option value="no">${t('numbering_plain')}</option>
+        </select>
+      </label>
       <p class="muted small">${t('new_building_total', { n: total })}</p>
       <div class="actions">
         <button class="btn primary" disabled=${busy}>${t('create_building')}</button>
@@ -477,6 +488,63 @@ function MaintenanceForm({ building, item, onClose }) {
   `;
 }
 
+// Who manages this building. Only the owner (who created it) adds or removes managers.
+function Managers({ building }) {
+  const list = useLoad(() => db.listManagers(building.id), [building.id]);
+  const [email, setEmail] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function add(e) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await db.addManager(building.id, email.trim());
+      setEmail('');
+      list.reload();
+      toast(t('saved'));
+    } catch (err) {
+      toast(errText(err), true);
+    }
+    setBusy(false);
+  }
+  async function remove(m) {
+    if (!(await ask(t('confirm_remove_manager', { email: m.email }), { ok: t('remove'), danger: true }))) return;
+    try {
+      await db.removeManager(building.id, m.user_id);
+      list.reload();
+    } catch (err) {
+      toast(errText(err), true);
+    }
+  }
+
+  return html`
+    <div class="card pad form section">
+      <h2>${t('managers')}</h2>
+      <p class="muted small">${t('managers_hint')}</p>
+      ${list.data
+        ? html`<div class="list">
+            ${list.data.map(
+              (m) => html`
+                <div class="row" style="padding:10px 0">
+                  <div class="main"><div class="title"><bdi>${m.email}</bdi></div></div>
+                  ${m.owner
+                    ? html`<span class="badge in">${t('owner')}</span>`
+                    : building.owner && html`<button class="btn small danger" onClick=${() => remove(m)}>${t('remove')}</button>`}
+                </div>
+              `,
+            )}
+          </div>`
+        : html`<${Loading} state=${list} />`}
+      ${building.owner &&
+      html`<form class="filters" style="margin:0" onSubmit=${add}>
+        <input type="email" required dir="ltr" placeholder=${t('manager_email')} aria-label=${t('manager_email')} value=${email}
+          onInput=${(e) => setEmail(e.target.value)} style="flex:1 1 200px" />
+        <button class="btn" disabled=${busy}>${t('add_manager')}</button>
+      </form>`}
+    </div>
+  `;
+}
+
 function Settings({ building, buildings, session, refresh, showSheet }) {
   const [f, setF] = useState({ name: building.name, currency: building.currency, opening_cash: String(building.opening_cash) });
   const [busy, setBusy] = useState(false);
@@ -527,6 +595,17 @@ function Settings({ building, buildings, session, refresh, showSheet }) {
     }
   }
 
+  async function rename(coded) {
+    if (!(await ask(t('confirm_rename'), { ok: t('rename_apartments') }))) return;
+    try {
+      await db.relabelUnits(building.id, coded);
+      changed();
+      toast(t('saved'));
+    } catch (err) {
+      toast(errText(err), true);
+    }
+  }
+
   if (adding) {
     return html`<${CreateBuilding}
       onCancel=${() => setAdding(false)}
@@ -567,6 +646,17 @@ function Settings({ building, buildings, session, refresh, showSheet }) {
     </form>
 
     <div class="card pad form section">
+      <h2>${t('rename_apartments')}</h2>
+      <p class="muted small">${t('rename_hint')}</p>
+      <div class="actions">
+        <button class="btn" onClick=${() => rename(true)}>${t('rename_coded')}</button>
+        <button class="btn" onClick=${() => rename(false)}>${t('rename_plain')}</button>
+      </div>
+    </div>
+
+    <${Managers} building=${building} />
+
+    <div class="card pad form section">
       <h2>${t('your_buildings')}</h2>
       <div class="list">
         ${buildings.map(
@@ -582,7 +672,7 @@ function Settings({ building, buildings, session, refresh, showSheet }) {
       </div>
       <div class="actions">
         <button class="btn" onClick=${() => setAdding(true)}>${t('add_building')}</button>
-        <button class="btn danger" onClick=${removeBuilding}>${t('delete_building')}</button>
+        ${building.owner && html`<button class="btn danger" onClick=${removeBuilding}>${t('delete_building')}</button>`}
       </div>
     </div>
 
