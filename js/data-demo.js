@@ -1,8 +1,8 @@
 // Demo data source: everything lives in this browser's localStorage.
 // Mirrors the API of data-supabase.js so the rest of the app doesn't care which is in use.
-// Demo logins: manager = any email and password. Resident = building DEMO01, any apartment 1-22, password 1234.
+// Demo logins: manager = any email and password. Resident = building DEMO01, any apartment F1-R to F11-L, password 1234.
 
-const KEY = 'building-fund-demo-v1';
+const KEY = 'building-fund-demo-v2';
 const B1 = 'demo-building';
 const DEMO_PASSWORD = '1234';
 
@@ -27,6 +27,12 @@ const nextMonth = (iso) => {
 };
 const newPassword = () => String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
 
+// Same rule as private.unit_label() in schema.sql: F3 / F3-R, F3-L / F3-1, F3-2 ...
+const unitLabel = (floor, k, perFloor) =>
+  perFloor <= 1 ? `F${floor}` : perFloor === 2 ? `F${floor}-${k === 1 ? 'R' : 'L'}` : `F${floor}-${k}`;
+// A label as people type it: no spaces, hyphens or underscores, lower case.
+const loose = (text) => String(text ?? '').replace(/[\s_-]/g, '').toLowerCase();
+
 function seed() {
   const s = {
     session: null,
@@ -42,7 +48,7 @@ function seed() {
   for (let n = 1; n <= 22; n++) {
     const id = 'u' + n;
     s.units.push({
-      id, building_id: B1, label: String(n), floor: Math.ceil(n / 2),
+      id, building_id: B1, label: unitLabel(Math.ceil(n / 2), n % 2 ? 1 : 2, 2), floor: Math.ceil(n / 2),
       resident_name: n % 2 ? names[(n - 1) / 2] : '', phone: '',
       monthly_fee: n % 7 === 0 ? 50 : n % 4 === 0 ? 100 : 120,
       opening_balance: n === 9 ? 240 : 0, charge_from: monthStart(-4), sort: n,
@@ -54,7 +60,7 @@ function seed() {
 
   // Payments: most apartments are up to date, a few are behind, a few paid ahead.
   for (const u of s.units) {
-    const n = Number(u.label);
+    const n = u.sort;
     const months = n % 5 === 0 ? 3 : n % 5 === 1 ? 7 : n % 3 === 0 ? 4 : 5;
     for (let i = 0; i < months; i++) {
       const offset = Math.min(-4 + i, 0);
@@ -203,7 +209,12 @@ export default {
 
   async residentLogin(code, label, password) {
     const b = s.buildings.find((x) => x.code === String(code).trim().toUpperCase());
-    const unit = b && s.units.find((u) => u.building_id === b.id && u.label.toLowerCase() === String(label).trim().toLowerCase());
+    const inB = b ? s.units.filter((u) => u.building_id === b.id) : [];
+    let unit = inB.find((u) => u.label.toLowerCase() === String(label).trim().toLowerCase());
+    if (!unit && loose(label)) {
+      const close = inB.filter((u) => loose(u.label) === loose(label));
+      if (close.length === 1) unit = close[0];
+    }
     if (!unit || s.passwords[unit.id] !== password) throw new Error('wrong_login');
     s.session = { role: 'resident', unit_id: unit.id };
     save();
@@ -218,9 +229,42 @@ export default {
   // ---- buildings (manager)
   async listBuildings() {
     requireManager();
-    return s.buildings.map((b) => ({ ...b }));
+    return s.buildings.map((b) => ({ ...b, owner: true }));
   },
-  async createBuilding({ name, floors, perFloor, fee, currency }) {
+  async relabelUnits(buildingId, coded) {
+    requireManager();
+    const units = s.units.filter((u) => u.building_id === buildingId && u.floor != null).sort((a, b) => a.floor - b.floor || a.sort - b.sort);
+    const perFloor = {};
+    units.forEach((u) => (perFloor[u.floor] = (perFloor[u.floor] ?? 0) + 1));
+    const seen = {};
+    units.forEach((u, i) => {
+      seen[u.floor] = (seen[u.floor] ?? 0) + 1;
+      u.label = coded ? unitLabel(u.floor, seen[u.floor], perFloor[u.floor]) : String(i + 1);
+    });
+    save();
+  },
+
+  // ---- managers of a building (the demo keeps a simple list of emails)
+  async listManagers(buildingId) {
+    requireManager();
+    const extra = (s.managers ?? {})[buildingId] ?? [];
+    return [{ user_id: 'me', email: s.session.email, owner: true }, ...extra.map((email) => ({ user_id: email, email, owner: false }))];
+  },
+  async addManager(buildingId, email) {
+    requireManager();
+    const e = String(email).trim().toLowerCase();
+    if (!e.includes('@')) throw new Error('no_account');
+    s.managers ??= {};
+    s.managers[buildingId] ??= [];
+    if (!s.managers[buildingId].includes(e) && e !== s.session.email) s.managers[buildingId].push(e);
+    save();
+  },
+  async removeManager(buildingId, userId) {
+    requireManager();
+    if (s.managers?.[buildingId]) s.managers[buildingId] = s.managers[buildingId].filter((e) => e !== userId);
+    save();
+  },
+  async createBuilding({ name, floors, perFloor, fee, currency, coded }) {
     requireManager();
     if (!String(name).trim() || floors < 1 || perFloor < 1 || floors * perFloor > 300 || fee < 0) throw new Error('bad_input');
     if (s.buildings.length >= 5) throw new Error('too_many_buildings');
@@ -235,12 +279,13 @@ export default {
       for (let k = 1; k <= perFloor; k++) {
         n++;
         const id = uid();
+        const label = coded !== false ? unitLabel(f, k, perFloor) : String(n);
         s.units.push({
-          id, building_id: b.id, label: String(n), floor: f, resident_name: '', phone: '', monthly_fee: Number(fee),
+          id, building_id: b.id, label, floor: f, resident_name: '', phone: '', monthly_fee: Number(fee),
           opening_balance: 0, charge_from: monthStart(0), sort: n, created_at: new Date().toISOString(),
         });
         s.passwords[id] = newPassword();
-        passwords.push({ label: String(n), floor: f, password: s.passwords[id] });
+        passwords.push({ label, floor: f, password: s.passwords[id] });
       }
     }
     save();
