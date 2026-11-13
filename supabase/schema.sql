@@ -457,6 +457,11 @@ begin
 end;
 $$;
 
+-- Table privileges for signed-in managers. The access rules below still decide which rows they get.
+-- (Needed when the project was created with "Automatically expose new tables" turned off.)
+grant select, insert, update, delete on public.buildings, public.units, public.entries, public.maintenance to authenticated;
+revoke all on public.unit_access, public.resident_sessions from anon, authenticated;
+
 -- Who may call what.
 revoke execute on function public.create_building(text, int, int, numeric, text) from public, anon;
 revoke execute on function public.set_unit_password(uuid, text) from public, anon;
