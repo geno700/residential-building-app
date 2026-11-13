@@ -102,6 +102,16 @@ create table if not exists public.maintenance (
 );
 create index if not exists maintenance_building_idx on public.maintenance (building_id, created_at desc);
 
+-- Extra managers of a building. The person who created it (buildings.manager_id) is its owner
+-- and is not listed here. No access rules: read and changed only through the functions below.
+create table if not exists public.building_managers (
+  building_id uuid not null references public.buildings (id) on delete cascade,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (building_id, user_id)
+);
+create index if not exists building_managers_user_idx on public.building_managers (user_id);
+
 -- ---------------------------------------------------------------- private helpers
 
 create or replace function private.new_code() returns text
@@ -113,6 +123,23 @@ $$;
 create or replace function private.new_password() returns text
 language sql volatile set search_path = public, extensions as $$
   select lpad(((('x' || encode(gen_random_bytes(4), 'hex'))::bit(32)::bigint) % 1000000)::text, 6, '0');
+$$;
+
+-- Apartment code from its floor and its position on the floor:
+--   1 per floor: F3      2 per floor: F3-R, F3-L (right, left)      more: F3-1, F3-2, F3-3 ...
+create or replace function private.unit_label(p_floor int, p_k int, p_per_floor int) returns text
+language sql immutable as $$
+  select case
+    when p_per_floor <= 1 then 'F' || p_floor
+    when p_per_floor = 2 then 'F' || p_floor || '-' || case when p_k = 1 then 'R' else 'L' end
+    else 'F' || p_floor || '-' || p_k
+  end;
+$$;
+
+-- A label as people type it: no spaces, hyphens or underscores, lower case. "f1 r" finds "F1-R".
+create or replace function private.loose(p_text text) returns text
+language sql immutable as $$
+  select lower(regexp_replace(coalesce(p_text, ''), '[\s_-]', '', 'g'));
 $$;
 
 create or replace function private.token_hash(p_token text) returns text
@@ -190,17 +217,112 @@ $$;
 
 create or replace function public.is_manager(p_building uuid) returns boolean
 language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.buildings where id = p_building and manager_id = auth.uid())
+      or exists (select 1 from public.building_managers where building_id = p_building and user_id = auth.uid());
+$$;
+
+-- The owner is the manager who created the building. Only the owner adds or removes
+-- other managers and deletes the building.
+create or replace function public.is_owner(p_building uuid) returns boolean
+language sql stable security definer set search_path = public as $$
   select exists (select 1 from public.buildings where id = p_building and manager_id = auth.uid());
+$$;
+
+-- Everyone who manages a building, the owner first.
+create or replace function public.list_managers(p_building uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_manager(p_building) then
+    raise exception 'not_allowed';
+  end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object('user_id', x.user_id, 'email', x.email, 'owner', x.owner) order by x.owner desc, x.created_at)
+    from (
+      select b.manager_id as user_id, u.email, true as owner, b.created_at
+      from public.buildings b join auth.users u on u.id = b.manager_id
+      where b.id = p_building
+      union all
+      select m.user_id, u.email, false, m.created_at
+      from public.building_managers m join auth.users u on u.id = m.user_id
+      where m.building_id = p_building
+    ) x
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Give another person full manager access. They must already have a manager account.
+create or replace function public.add_manager(p_building uuid, p_email text) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_user uuid;
+begin
+  if not public.is_owner(p_building) then
+    raise exception 'owner_only';
+  end if;
+  select id into v_user from auth.users where lower(email) = lower(trim(coalesce(p_email, '')));
+  if v_user is null then
+    raise exception 'no_account';
+  end if;
+  if v_user = auth.uid() then
+    return;
+  end if;
+  if (select count(*) from public.building_managers where building_id = p_building) >= 10 then
+    raise exception 'too_many_managers';
+  end if;
+  insert into public.building_managers (building_id, user_id) values (p_building, v_user)
+  on conflict do nothing;
+end;
+$$;
+
+-- The owner removes a manager, or a manager removes themself.
+create or replace function public.remove_manager(p_building uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not (public.is_owner(p_building) or p_user = auth.uid()) then
+    raise exception 'owner_only';
+  end if;
+  delete from public.building_managers where building_id = p_building and user_id = p_user;
+end;
+$$;
+
+-- Rename every apartment from its floor: coded (F1-R, F1-L ...) or numbered (1, 2, 3 ...).
+-- Apartments without a floor keep their name. Passwords and balances are not touched.
+create or replace function public.relabel_units(p_building uuid, p_coded boolean default true) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager(p_building) then
+    raise exception 'not_allowed';
+  end if;
+  -- Two steps, so a new name never collides with an old one that is about to change.
+  update public.units set label = substr(md5(id::text), 1, 16)
+  where building_id = p_building and floor is not null;
+  update public.units u set label = x.label
+  from (
+    select id,
+      case when p_coded
+        then private.unit_label(
+          floor,
+          (row_number() over (partition by floor order by sort, created_at))::int,
+          (count(*) over (partition by floor))::int)
+        else (row_number() over (order by floor, sort, created_at))::text
+      end as label
+    from public.units where building_id = p_building and floor is not null
+  ) x
+  where u.id = x.id;
+end;
 $$;
 
 -- Start a building. Creates the apartments and a password for each one.
 -- The passwords are returned once here and are never readable again (only replaceable).
+-- p_coded: name apartments F1-R, F1-L ... (true) or 1, 2, 3 ... (false).
+drop function if exists public.create_building(text, int, int, numeric, text);
 create or replace function public.create_building(
   p_name text,
   p_floors int,
   p_per_floor int,
   p_fee numeric,
-  p_currency text default 'EGP'
+  p_currency text default 'EGP',
+  p_coded boolean default true
 ) returns jsonb
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -209,6 +331,7 @@ declare
   v_n int := 0;
   v_unit uuid;
   v_pw text;
+  v_label text;
   v_list jsonb := '[]'::jsonb;
 begin
   if auth.uid() is null then
@@ -238,11 +361,12 @@ begin
     for k in 1..p_per_floor loop
       v_n := v_n + 1;
       v_pw := private.new_password();
+      v_label := case when coalesce(p_coded, true) then private.unit_label(f, k, p_per_floor) else v_n::text end;
       insert into public.units (building_id, label, floor, monthly_fee, sort)
-      values (v_b.id, v_n::text, f, p_fee, v_n)
+      values (v_b.id, v_label, f, p_fee, v_n)
       returning id into v_unit;
       insert into public.unit_access (unit_id, password_hash) values (v_unit, crypt(v_pw, gen_salt('bf')));
-      v_list := v_list || jsonb_build_object('label', v_n::text, 'floor', f, 'password', v_pw);
+      v_list := v_list || jsonb_build_object('label', v_label, 'floor', f, 'password', v_pw);
     end loop;
   end loop;
 
@@ -336,6 +460,14 @@ begin
   from public.units u
   join public.buildings b on b.id = u.building_id
   where b.code = upper(trim(coalesce(p_code, ''))) and lower(u.label) = lower(trim(coalesce(p_unit, '')));
+  -- Not typed exactly: accept it without spaces and hyphens ("f1r" for "F1-R") if only one apartment fits.
+  if v_unit is null and private.loose(p_unit) <> '' then
+    select min(u.id::text)::uuid into v_unit
+    from public.units u
+    join public.buildings b on b.id = u.building_id
+    where b.code = upper(trim(coalesce(p_code, ''))) and private.loose(u.label) = private.loose(p_unit)
+    having count(*) = 1;
+  end if;
   if v_unit is null then
     return jsonb_build_object('ok', false, 'error', 'wrong_login');
   end if;
@@ -459,15 +591,28 @@ $$;
 
 -- Table privileges for signed-in managers. The access rules below still decide which rows they get.
 -- (Needed when the project was created with "Automatically expose new tables" turned off.)
-grant select, insert, update, delete on public.buildings, public.units, public.entries, public.maintenance to authenticated;
-revoke all on public.unit_access, public.resident_sessions from anon, authenticated;
+grant select, insert, update, delete on public.units, public.entries, public.maintenance to authenticated;
+grant select, delete on public.buildings to authenticated;
+-- Managers may change a building's name, currency and opening balance, but not its code or owner.
+revoke update on public.buildings from anon, authenticated;
+grant update (name, currency, opening_cash) on public.buildings to authenticated;
+revoke all on public.unit_access, public.resident_sessions, public.building_managers from anon, authenticated;
 
 -- Who may call what.
-revoke execute on function public.create_building(text, int, int, numeric, text) from public, anon;
+revoke execute on function public.create_building(text, int, int, numeric, text, boolean) from public, anon;
+revoke execute on function public.relabel_units(uuid, boolean) from public, anon;
+revoke execute on function public.list_managers(uuid) from public, anon;
+revoke execute on function public.add_manager(uuid, text) from public, anon;
+revoke execute on function public.remove_manager(uuid, uuid) from public, anon;
+grant execute on function public.relabel_units(uuid, boolean) to authenticated;
+grant execute on function public.list_managers(uuid) to authenticated;
+grant execute on function public.add_manager(uuid, text) to authenticated;
+grant execute on function public.remove_manager(uuid, uuid) to authenticated;
+grant execute on function public.is_owner(uuid) to anon, authenticated;
 revoke execute on function public.set_unit_password(uuid, text) from public, anon;
 revoke execute on function public.reset_all_passwords(uuid) from public, anon;
 revoke execute on function public.manager_overview(uuid) from public, anon;
-grant execute on function public.create_building(text, int, int, numeric, text) to authenticated;
+grant execute on function public.create_building(text, int, int, numeric, text, boolean) to authenticated;
 grant execute on function public.set_unit_password(uuid, text) to authenticated;
 grant execute on function public.reset_all_passwords(uuid) to authenticated;
 grant execute on function public.manager_overview(uuid) to authenticated;
@@ -487,6 +632,7 @@ alter table public.unit_access enable row level security;
 alter table public.resident_sessions enable row level security;
 alter table public.entries enable row level security;
 alter table public.maintenance enable row level security;
+alter table public.building_managers enable row level security;
 
 do $$
 declare r record;
@@ -501,11 +647,11 @@ begin
 end $$;
 
 -- Buildings are created with create_building().
-create policy "manager reads own buildings" on public.buildings for select to authenticated
-  using (manager_id = auth.uid());
-create policy "manager edits own buildings" on public.buildings for update to authenticated
-  using (manager_id = auth.uid()) with check (manager_id = auth.uid());
-create policy "manager deletes own buildings" on public.buildings for delete to authenticated
+create policy "managers read their buildings" on public.buildings for select to authenticated
+  using (public.is_manager(id));
+create policy "managers edit their buildings" on public.buildings for update to authenticated
+  using (public.is_manager(id)) with check (public.is_manager(id));
+create policy "owner deletes building" on public.buildings for delete to authenticated
   using (manager_id = auth.uid());
 
 create policy "manager reads apartments" on public.units for select to authenticated
