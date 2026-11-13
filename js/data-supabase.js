@@ -100,17 +100,35 @@ export default {
 
   // ---- buildings (manager)
   async listBuildings() {
+    const { data } = await sb.auth.getSession();
+    const me = data.session?.user?.id;
     return ok(await sb.from('buildings').select('*').order('created_at')).map((b) => ({
       ...b,
       opening_cash: num(b.opening_cash),
+      owner: b.manager_id === me,
     }));
   },
-  async createBuilding({ name, floors, perFloor, fee, currency }) {
+  async createBuilding({ name, floors, perFloor, fee, currency, coded }) {
     return ok(
       await sb.rpc('create_building', {
         p_name: name, p_floors: Number(floors), p_per_floor: Number(perFloor), p_fee: Number(fee), p_currency: currency,
+        p_coded: coded !== false,
       }),
     );
+  },
+  async relabelUnits(buildingId, coded) {
+    ok(await sb.rpc('relabel_units', { p_building: buildingId, p_coded: coded }));
+  },
+
+  // ---- managers of a building
+  async listManagers(buildingId) {
+    return ok(await sb.rpc('list_managers', { p_building: buildingId }));
+  },
+  async addManager(buildingId, email) {
+    ok(await sb.rpc('add_manager', { p_building: buildingId, p_email: email }));
+  },
+  async removeManager(buildingId, userId) {
+    ok(await sb.rpc('remove_manager', { p_building: buildingId, p_user: userId }));
   },
   async updateBuilding(id, { name, currency, opening_cash }) {
     ok(await sb.from('buildings').update({ name: name.trim(), currency: currency.trim(), opening_cash: Number(opening_cash) }).eq('id', id));
