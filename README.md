@@ -19,6 +19,8 @@ Arabic and English. Anyone can register their own building; each building's data
 - Sets each apartment's opening balance, and can change it at any time to correct the balance.
 - Keeps a maintenance list, including problems reported by residents.
 - Is the only one who can set or replace apartment passwords.
+- Names apartments by floor (`F1-R` and `F1-L` for two per floor, `F1-1`, `F1-2`, `F1-3` for more) or by plain numbers, and can switch between the two later in Settings.
+- Can add other managers by email. The person who created the building is its owner; only the owner adds or removes managers and deletes the building.
 
 **Each apartment** (building code + apartment number + password):
 
@@ -36,7 +38,7 @@ python -m http.server 5183
 ```
 
 Then open http://localhost:5183. In demo mode, sign in as manager with any email and password,
-or as a resident with building `DEMO01`, any apartment from 1 to 22, and password `1234`.
+or as a resident with building `DEMO01`, any apartment from `F1-R` to `F11-L`, and password `1234`.
 
 ## Go live
 
