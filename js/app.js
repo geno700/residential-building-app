@@ -49,7 +49,7 @@ function ResidentLogin() {
       ${error && html`<p class="error">${error}</p>`}
       ${demoMode && html`<p class="small muted">${t('demo_resident_hint')}</p>`}
       <label><span>${t('building_code')}</span><input required dir="ltr" autocapitalize="characters" autocomplete="off" value=${f.code} onInput=${set('code')} /></label>
-      <label><span>${t('apartment_number')}</span><input required dir="ltr" inputmode="numeric" autocomplete="username" value=${f.unit} onInput=${set('unit')} /></label>
+      <label><span>${t('apartment_number')}</span><input required dir="ltr" autocapitalize="characters" autocomplete="username" placeholder="F3-R" value=${f.unit} onInput=${set('unit')} /></label>
       <label><span>${t('password')}</span><input type="password" required dir="ltr" autocomplete="current-password" value=${f.password} onInput=${set('password')} /></label>
       <button class="btn primary" disabled=${busy}>${t('sign_in')}</button>
       <p class="small muted">${t('resident_login_hint')}</p>
