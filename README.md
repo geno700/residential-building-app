@@ -16,18 +16,21 @@ Arabic and English. Anyone can register their own building; each building's data
 - Records fee payments. An apartment that pays more than it owes shows as paid in advance.
 - Records building expenses (elevator, cleaning, repairs, electricity) and other income.
 - Records a water, gas or other bill paid **from the manager's own pocket** for an apartment. It is added to what that apartment owes the manager and does not touch the building fund.
-- Sets each apartment's opening balance, and can change it at any time to correct the balance.
-- Keeps a maintenance list, including problems reported by residents.
-- Is the only one who can set or replace apartment passwords.
+- Sets each apartment's balance to the real figure at any time (**Apartments > Edit all** does it for every apartment in one table).
+- Adds one-time extra fees, for one apartment or all of them, for example for an upgrade project.
+- Keeps a maintenance list.
+- Is the only one who can set, read or replace apartment passwords.
+- Sends a resident their balance and sign-in details by WhatsApp, from the apartment's page.
+- Saves a building report or an apartment's statement as a PDF.
+- Backs up and restores the building: a copy is saved automatically once a day, and **Settings > Backup and restore** downloads a backup file or goes back to an earlier copy.
 - Names apartments by floor (`F1-R` and `F1-L` for two per floor, `F1-1`, `F1-2`, `F1-3` for more) or by plain numbers, and can switch between the two later in Settings.
 - Can add other managers by email. The person who created the building is its owner; only the owner adds or removes managers and deletes the building.
 
 **Each apartment** (building code + apartment number + password):
 
 - Sees what it owes or has paid in advance, with a full statement.
-- Sees the building fund: balance, money collected and spent month by month, and every expense.
-- Does **not** see other apartments' balances.
-- Can report a maintenance problem.
+- Sees one figure about the building: the balance of the building fund.
+- Does **not** see other apartments' balances or the building's expenses.
 
 ## Try it on this PC
 
@@ -76,7 +79,7 @@ so either set up your own sender (**Authentication > Emails > SMTP settings**) o
 ### 4. Set up your building
 
 1. Open the app, choose **Manager**, create an account and sign in.
-2. Fill in the building form. The next page lists every apartment's password. **Print it**: passwords are shown only once.
+2. Fill in the building form. The next page lists every apartment's password. Each password is also shown on its apartment's page.
 3. In **Settings**, copy the resident link and send it to the residents with their passwords.
 4. In **Apartments**, set each apartment's fee, resident name and opening balance.
 5. In **Settings**, enter the money that is already in the building fund.
@@ -96,9 +99,10 @@ A new fee applies from the next month; months already charged keep their amount.
 
 ## Security notes
 
-- Apartment passwords are stored hashed. Nobody can read them back, including the manager; they can only be replaced.
+- Apartment passwords are checked against a hash, and are also kept readable for the building's managers so they can send them to residents. Residents cannot read or change them. Backup files contain these passwords, so keep the files private.
+- Backups are stored in the same database. Download a backup file now and then to have a copy outside it.
 - Five wrong passwords lock an apartment's sign-in for 15 minutes.
-- Residents have no direct access to the database tables. Everything they see comes from one function that returns only their own apartment and the building totals.
+- Residents have no direct access to the database tables. Everything they see comes from one function that returns only their own apartment and the building fund's balance.
 - Whoever runs the Supabase project can read every building's data in it. If that matters to you, run your own copy.
 
 ## Notes
