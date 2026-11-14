@@ -8,4 +8,6 @@ export const config = {
   // Used for the link residents open. Leave empty to use the address the app is opened from.
   appUrl: 'https://geno700.github.io/residential-building-app/',
   appName: 'Residential Building App',
+  // Country calling code added to local phone numbers for WhatsApp links (20 = Egypt).
+  countryCode: '20',
 };
