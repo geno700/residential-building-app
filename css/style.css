@@ -232,6 +232,11 @@ td.num, th:not(:first-child) { text-align: end; }
   th { white-space: normal; }
 }
 
+.grid-edit td { padding: 6px 8px; }
+.grid-edit td:first-child { padding-inline-start: 16px; }
+.grid-edit input { min-width: 96px; min-height: 38px; }
+.grid-edit td:nth-child(2) input { min-width: 140px; }
+
 .join-code { font-family: ui-monospace, Consolas, monospace; font-size: 1.15rem; font-weight: 700; letter-spacing: 0.12em; }
 
 /* ---------- password sheet ---------- */
