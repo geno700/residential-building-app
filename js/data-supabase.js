@@ -150,16 +150,20 @@ export default {
       resident_name: u.resident_name?.trim() || null,
       phone: u.phone?.trim() || null,
       monthly_fee: Number(u.monthly_fee || 0),
-      opening_balance: Number(u.opening_balance || 0),
     };
     const q = u.id
       ? sb.from('units').update(fields).eq('id', u.id)
       : sb.from('units').insert({ ...fields, building_id: buildingId, sort: Date.now() % 2000000000 });
-    const { error } = await q;
+    const { data, error } = await q.select('id').single();
     if (error) throw new Error(error.code === '23505' ? 'label_taken' : error.message);
+    return data.id;
   },
   async deleteUnit(id) {
     ok(await sb.from('units').delete().eq('id', id));
+  },
+  // Make the apartment's fee balance exactly this amount now (positive: owes, negative: credit).
+  async setUnitBalance(unitId, target) {
+    ok(await sb.rpc('set_unit_balance', { p_unit: unitId, p_target: Number(target) }));
   },
   async setUnitPassword(unitId, password) {
     return ok(await sb.rpc('set_unit_password', { p_unit: unitId, p_password: password || null }));
@@ -177,11 +181,17 @@ export default {
     return ok(await q).map(flatEntry);
   },
   async addEntry(buildingId, e) {
+    await this.addEntries(buildingId, [e]);
+  },
+  // Several entries in one go, e.g. the same extra fee for every apartment.
+  async addEntries(buildingId, list) {
     ok(
-      await sb.from('entries').insert({
-        building_id: buildingId, unit_id: e.unit_id || null, kind: e.kind, amount: Number(e.amount),
-        entry_date: e.entry_date, category: e.category || null, note: e.note?.trim() || null,
-      }),
+      await sb.from('entries').insert(
+        list.map((e) => ({
+          building_id: buildingId, unit_id: e.unit_id || null, kind: e.kind, amount: Number(e.amount),
+          entry_date: e.entry_date, category: e.category || null, note: e.note?.trim() || null,
+        })),
+      ),
     );
   },
   async deleteEntry(id) {
