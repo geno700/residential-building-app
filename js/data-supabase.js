@@ -5,7 +5,43 @@ import { config } from '../config.js';
 // A password-reset link brings the manager back with this marker in the address.
 let recovery = location.hash.includes('type=recovery');
 
-const sb = createClient(config.supabaseUrl, config.supabaseAnonKey);
+// On a phone whose clock is wrong, or one that stops the app in the background, the manager's
+// login token runs out without being renewed and the database answers "JWT expired".
+// When that happens: renew the login and send the same request once more. If it cannot be renewed,
+// drop the stale login and send the request without it, so residents are never blocked by it.
+let renewing = null;
+async function steadyFetch(input, init) {
+  const res = await fetch(input, init);
+  const url = typeof input === 'string' ? input : input?.url ?? '';
+  if (res.status !== 401 || !url.includes('/rest/v1/')) return res;
+  let body = '';
+  try {
+    body = await res.clone().text();
+  } catch {
+    // Unreadable answer: treat it as an ordinary error.
+  }
+  if (!/jwt/i.test(body)) return res;
+  renewing ??= (async () => {
+    try {
+      const { data, error } = await sb.auth.refreshSession();
+      if (!error && data?.session?.access_token) return data.session.access_token;
+    } catch {
+      // Falls through to dropping the login.
+    }
+    try {
+      await sb.auth.signOut({ scope: 'local' });
+    } catch {
+      // Already signed out.
+    }
+    return config.supabaseAnonKey;
+  })().finally(() => setTimeout(() => (renewing = null), 0));
+  const token = await renewing;
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', 'Bearer ' + token);
+  return fetch(input, { ...init, headers });
+}
+
+const sb = createClient(config.supabaseUrl, config.supabaseAnonKey, { global: { fetch: steadyFetch } });
 
 const ok = ({ data, error }) => {
   if (error) throw new Error(error.message);
@@ -173,12 +209,23 @@ export default {
   },
 
   // ---- ledger (manager)
-  async listEntries(buildingId, { unitId, kinds, limit = 300 } = {}) {
-    let q = sb.from('entries').select('*, unit:units(label)').eq('building_id', buildingId)
-      .order('entry_date', { ascending: false }).order('created_at', { ascending: false }).limit(limit);
-    if (unitId) q = q.eq('unit_id', unitId);
-    if (kinds) q = q.in('kind', kinds);
-    return ok(await q).map(flatEntry);
+  // from / to: dates (YYYY-MM-DD) to keep only that period, for reports.
+  async listEntries(buildingId, { unitId, kinds, from, to, limit = 300 } = {}) {
+    const rows = [];
+    // The database hands out at most 1000 rows at a time.
+    while (rows.length < limit) {
+      let q = sb.from('entries').select('*, unit:units(label)').eq('building_id', buildingId)
+        .order('entry_date', { ascending: false }).order('created_at', { ascending: false }).order('id')
+        .range(rows.length, Math.min(limit, rows.length + 1000) - 1);
+      if (unitId) q = q.eq('unit_id', unitId);
+      if (kinds) q = q.in('kind', kinds);
+      if (from) q = q.gte('entry_date', from);
+      if (to) q = q.lte('entry_date', to);
+      const page = ok(await q);
+      rows.push(...page);
+      if (page.length < 1000) break;
+    }
+    return rows.map(flatEntry);
   },
   async addEntry(buildingId, e) {
     await this.addEntries(buildingId, [e]);
@@ -220,6 +267,22 @@ export default {
     ok(await sb.from('maintenance').delete().eq('id', id));
   },
 
+  // ---- backups (manager)
+  // Saves a copy in the database and returns its content, to download as a file.
+  async backupNow(buildingId) {
+    return ok(await sb.rpc('backup_now', { p_building: buildingId }));
+  },
+  async listBackups(buildingId) {
+    return ok(await sb.rpc('list_backups', { p_building: buildingId }));
+  },
+  async getBackup(id) {
+    return ok(await sb.rpc('get_backup', { p_backup: id }));
+  },
+  // Give either the id of a saved backup or the content of a backup file.
+  async restoreBackup(buildingId, { id = null, data = null }) {
+    return ok(await sb.rpc('restore_backup', { p_building: buildingId, p_backup: id, p_data: data }));
+  },
+
   // ---- resident
   async residentOverview() {
     const { data, error } = await sb.rpc('resident_overview', { p_token: getToken() });
@@ -231,15 +294,10 @@ export default {
       throw new Error(error.message);
     }
     return {
-      ...data,
+      building: data.building,
       unit: flatUnit(data.unit),
       summary: flatSummary(data.summary),
-      statement: data.statement.map(flatEntry),
-      ledger: data.ledger.map(flatEntry),
-      months: data.months.map((m) => ({ month: m.month, collected: num(m.collected), income: num(m.income), spent: num(m.spent) })),
+      statement: (data.statement ?? []).map(flatEntry),
     };
-  },
-  async residentReport(title, details) {
-    ok(await sb.rpc('resident_report', { p_token: getToken(), p_title: title, p_details: details || null }));
   },
 };
