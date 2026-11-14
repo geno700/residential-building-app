@@ -162,7 +162,30 @@ function summary(buildingId) {
   };
 }
 
-const byDateDesc = (a, b) => b.entry_date.localeCompare(a.entry_date) || b.created_at.localeCompare(a.created_at);
+// The content of a backup: the same shape as private.snapshot() in schema.sql.
+function snapshot(buildingId) {
+  const b = s.buildings.find((x) => x.id === buildingId);
+  const copy = (x) => JSON.parse(JSON.stringify(x));
+  return {
+    app: 'residential-building-app', version: 1, taken_at: new Date().toISOString(),
+    building: { name: b.name, code: b.code, currency: b.currency, opening_cash: b.opening_cash },
+    units: copy(s.units.filter((u) => u.building_id === buildingId)).map((u) => ({ ...u, password: s.passwords[u.id] ?? null })),
+    entries: copy(s.entries.filter((e) => e.building_id === buildingId)),
+    maintenance: copy(s.maintenance.filter((m) => m.building_id === buildingId)),
+  };
+}
+// The demo keeps only a few copies, because everything lives in this browser's small storage.
+function saveBackup(buildingId, kind) {
+  s.backups ??= [];
+  const row = { id: uid(), building_id: buildingId, kind, created_at: new Date().toISOString(), data: snapshot(buildingId) };
+  s.backups.push(row);
+  const same = s.backups.filter((k) => k.building_id === buildingId && k.kind === kind);
+  const drop = new Set(same.slice(0, Math.max(0, same.length - 3)).map((k) => k.id));
+  s.backups = s.backups.filter((k) => !drop.has(k.id));
+  return row;
+}
+
+const byDateDesc =(a, b) => b.entry_date.localeCompare(a.entry_date) || b.created_at.localeCompare(a.created_at);
 const withLabel = (e) => ({ ...e, unit_label: s.units.find((u) => u.id === e.unit_id)?.label ?? '' });
 
 function requireManager() {
@@ -311,10 +334,16 @@ export default {
   async overview(buildingId) {
     requireManager();
     chargeDues(buildingId);
+    // The daily automatic backup.
+    const dayAgo = new Date(Date.now() - 20 * 3600000).toISOString();
+    if (!(s.backups ?? []).some((k) => k.building_id === buildingId && k.kind === 'auto' && k.created_at > dayAgo)) {
+      saveBackup(buildingId, 'auto');
+      save();
+    }
     const units = s.units
       .filter((u) => u.building_id === buildingId)
       .sort((a, b) => a.sort - b.sort)
-      .map((u) => ({ ...u, ...balances(u), has_password: !!s.passwords[u.id] }));
+      .map((u) => ({ ...u, ...balances(u), has_password: !!s.passwords[u.id], password: s.passwords[u.id] ?? null }));
     return { summary: summary(buildingId), units };
   },
 
@@ -388,10 +417,11 @@ export default {
   },
 
   // ---- ledger (manager)
-  async listEntries(buildingId, { unitId, kinds, limit = 300 } = {}) {
+  async listEntries(buildingId, { unitId, kinds, from, to, limit = 300 } = {}) {
     requireManager();
     return s.entries
       .filter((e) => e.building_id === buildingId && (!unitId || e.unit_id === unitId) && (!kinds || kinds.includes(e.kind)))
+      .filter((e) => (!from || e.entry_date >= from) && (!to || e.entry_date <= to))
       .sort(byDateDesc)
       .slice(0, limit)
       .map(withLabel);
@@ -441,19 +471,60 @@ export default {
     save();
   },
 
+  // ---- backups (manager)
+  async backupNow(buildingId) {
+    requireManager();
+    const row = saveBackup(buildingId, 'manual');
+    save();
+    return row.data;
+  },
+  async listBackups(buildingId) {
+    requireManager();
+    return (s.backups ?? [])
+      .filter((k) => k.building_id === buildingId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .map((k) => ({ id: k.id, kind: k.kind, created_at: k.created_at, units: k.data.units.length, entries: k.data.entries.length }));
+  },
+  async getBackup(id) {
+    requireManager();
+    const row = (s.backups ?? []).find((k) => k.id === id);
+    if (!row) throw new Error('not_allowed');
+    return row.data;
+  },
+  async restoreBackup(buildingId, { id = null, data = null }) {
+    requireManager();
+    const v = id ? (s.backups ?? []).find((k) => k.id === id && k.building_id === buildingId)?.data : data;
+    if (v?.app !== 'residential-building-app' || !Array.isArray(v.units) || !Array.isArray(v.entries) || !v.building) {
+      throw new Error('bad_backup');
+    }
+    const ids = new Set(v.units.map((u) => u.id));
+    if (s.units.some((u) => ids.has(u.id) && u.building_id !== buildingId)) throw new Error('backup_other_building');
+    saveBackup(buildingId, 'before_restore');
+    const b = s.buildings.find((x) => x.id === buildingId);
+    Object.assign(b, { name: v.building.name || b.name, currency: v.building.currency || b.currency, opening_cash: Number(v.building.opening_cash ?? b.opening_cash) });
+    const before = new Set(s.units.filter((u) => u.building_id === buildingId).map((u) => u.id));
+    before.forEach((u) => !ids.has(u) && delete s.passwords[u]);
+    s.units = s.units.filter((u) => u.building_id !== buildingId);
+    s.entries = s.entries.filter((e) => e.building_id !== buildingId);
+    s.maintenance = s.maintenance.filter((m) => m.building_id !== buildingId);
+    for (const u of v.units) {
+      const { password, ...unit } = u;
+      s.units.push({ ...unit, building_id: buildingId, monthly_fee: Number(unit.monthly_fee), opening_balance: Number(unit.opening_balance) });
+      // Apartments that still existed keep their password.
+      if (!before.has(u.id) && password) s.passwords[u.id] = password;
+    }
+    for (const e of v.entries) s.entries.push({ ...e, building_id: buildingId, amount: Number(e.amount) });
+    for (const m of v.maintenance ?? []) s.maintenance.push({ ...m, building_id: buildingId, unit_id: ids.has(m.unit_id) ? m.unit_id : null });
+    save();
+    return { units: v.units.length, entries: v.entries.length, taken_at: v.taken_at };
+  },
+
   // ---- resident
   async residentOverview() {
     const unit = residentUnit();
     const b = s.buildings.find((x) => x.id === unit.building_id);
     chargeDues(b.id);
     const mine = s.entries.filter((e) => e.building_id === b.id);
-    const months = {};
-    for (const e of mine) {
-      if (!['payment', 'income', 'expense'].includes(e.kind)) continue;
-      const m = e.entry_date.slice(0, 7) + '-01';
-      months[m] ??= { month: m, collected: 0, income: 0, spent: 0 };
-      months[m][e.kind === 'payment' ? 'collected' : e.kind === 'income' ? 'income' : 'spent'] += e.amount;
-    }
     return {
       building: { name: b.name, currency: b.currency },
       unit: {
@@ -461,23 +532,8 @@ export default {
         opening_balance: unit.opening_balance, ...balances(unit),
       },
       statement: mine.filter((e) => e.unit_id === unit.id).sort(byDateDesc),
-      summary: summary(b.id),
-      ledger: mine.filter((e) => e.kind === 'expense' || e.kind === 'income').sort(byDateDesc),
-      months: Object.values(months).sort((a, c) => c.month.localeCompare(a.month)).slice(0, 12),
-      maintenance: s.maintenance
-        .filter((m) => m.building_id === b.id)
-        .sort((a, c) => c.created_at.localeCompare(a.created_at))
-        .map((m) => ({ id: m.id, title: m.title, details: m.details, status: m.status, created_at: m.created_at, done_at: m.done_at, mine: m.unit_id === unit.id })),
+      // Of the building's money a resident sees one figure: what is in the fund now.
+      summary: { cash: summary(b.id).cash },
     };
-  },
-  async residentReport(title, details) {
-    const unit = residentUnit();
-    if (!String(title).trim()) throw new Error('bad_input');
-    if (s.maintenance.filter((m) => m.unit_id === unit.id && m.status !== 'done').length >= 5) throw new Error('too_many_reports');
-    s.maintenance.push({
-      id: uid(), building_id: unit.building_id, title: String(title).trim().slice(0, 120), details: String(details ?? '').trim(),
-      status: 'open', unit_id: unit.id, created_at: new Date().toISOString(), done_at: null,
-    });
-    save();
   },
 };
