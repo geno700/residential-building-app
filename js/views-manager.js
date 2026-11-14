@@ -4,8 +4,11 @@ import { db, demoMode } from './data.js';
 import { t, LangButton } from './i18n.js';
 import {
   EXPENSE_CATS, BILL_CATS, STATUSES, money, fmtDate, today, latinDigits, errText, catLabel, owedText, owedClass,
-  residentLink, remember, go, useRoute, toast, ask, Modal, changed, useLoad, EntryRow, Tile, Loading,
+  residentLink, remember, go, useRoute, toast, ask, Modal, changed, useLoad, EntryRow, Tile, Loading, waLink, plain,
 } from './ui.js';
+
+// A balance as typed into a field: no thousands separators, at most two decimals.
+const asInput = (n) => String(Math.round(Number(n ?? 0) * 100) / 100);
 
 const CURRENT_KEY = 'building-fund-current';
 export const lastBuilding = () => {
@@ -120,24 +123,29 @@ export function AccessSheet({ sheet, onClose }) {
 
 const ENTRY_TITLES = {
   payment: 'record_payment', bill: 'add_bill', bill_payment: 'record_bill_payment', expense: 'add_expense', income: 'add_income',
+  extra: 'add_extra',
 };
 
 function EntryForm({ building, units, preset, onClose }) {
   const kind = preset.kind;
-  const forUnit = ['payment', 'bill', 'bill_payment'].includes(kind);
+  const forUnit = ['payment', 'bill', 'bill_payment', 'extra'].includes(kind);
   const cats = kind === 'bill' ? BILL_CATS : kind === 'expense' ? EXPENSE_CATS : null;
   const first = units.find((u) => u.id === preset.unit_id) ?? null;
   const suggest = (u) =>
     !u ? '' : kind === 'payment' ? String(u.dues > 0 ? u.dues : u.monthly_fee || '') : kind === 'bill_payment' && u.bills > 0 ? String(u.bills) : '';
   const [f, setF] = useState({
-    unit_id: first?.id ?? '', amount: suggest(first), entry_date: today(), category: cats?.[0] ?? '', note: '',
+    unit_id: first?.id ?? (kind === 'extra' ? 'all' : ''), amount: suggest(first), entry_date: today(),
+    category: cats?.[0] ?? '', note: '',
   });
   const unit = units.find((u) => u.id === f.unit_id);
   const cur = building.currency;
 
   async function submit() {
     if (!(Number(f.amount) > 0)) throw new Error('bad_amount');
-    await db.addEntry(building.id, { ...f, kind, amount: Number(f.amount) });
+    const entry = { ...f, kind, amount: Number(f.amount) };
+    // An extra fee can go to every apartment at once.
+    if (f.unit_id === 'all') await db.addEntries(building.id, units.map((u) => ({ ...entry, unit_id: u.id })));
+    else await db.addEntry(building.id, entry);
     changed();
     toast(t('saved'));
     onClose();
@@ -146,6 +154,7 @@ function EntryForm({ building, units, preset, onClose }) {
   return html`
     <${Modal} title=${t(ENTRY_TITLES[kind])} onClose=${onClose} onSubmit=${submit}>
       ${kind === 'bill' && html`<p class="muted small">${t('bill_hint')}</p>`}
+      ${kind === 'extra' && html`<p class="muted small">${t('extra_hint')}</p>`}
       ${forUnit &&
       html`<label>
         <span>${t('apartment')}</span>
@@ -154,7 +163,9 @@ function EntryForm({ building, units, preset, onClose }) {
             const u = units.find((x) => x.id === e.target.value);
             setF({ ...f, unit_id: e.target.value, amount: suggest(u) });
           }}>
-          <option value="">${t('choose')}</option>
+          ${kind === 'extra'
+            ? html`<option value="all">${t('all_apartments', { n: units.length })}</option>`
+            : html`<option value="">${t('choose')}</option>`}
           ${units.map((u) => html`<option value=${u.id}>${u.label}${u.resident_name ? ' · ' + u.resident_name : ''}</option>`)}
         </select>
       </label>`}
@@ -171,7 +182,10 @@ function EntryForm({ building, units, preset, onClose }) {
         <label><span>${t('amount')} (${cur})</span>${numberInput(f.amount, (v) => setF({ ...f, amount: v }), { required: true })}</label>
         <label><span>${t('date')}</span><input type="date" required value=${f.entry_date} onInput=${(e) => setF({ ...f, entry_date: e.target.value })} /></label>
       </div>
-      <label><span>${t('note')}</span><input maxlength="200" value=${f.note} onInput=${(e) => setF({ ...f, note: e.target.value })} /></label>
+      <label>
+        <span>${kind === 'extra' ? t('extra_what') : t('note')}</span>
+        <input maxlength="200" required=${kind === 'extra'} value=${f.note} onInput=${(e) => setF({ ...f, note: e.target.value })} />
+      </label>
     <//>
   `;
 }
@@ -249,7 +263,79 @@ function UnitRow({ u, cur }) {
   `;
 }
 
-function Units({ building, ov, onEdit }) {
+// Every apartment in one table, to set names, phones, fees and balances quickly.
+function BulkEdit({ building, ov }) {
+  const start = (u) => ({
+    id: u.id, resident_name: u.resident_name ?? '', phone: u.phone ?? '', monthly_fee: asInput(u.monthly_fee), balance: asInput(u.dues),
+  });
+  const [rows, setRows] = useState(() => ov.units.map(start));
+  const [busy, setBusy] = useState(false);
+  const set = (i, k, v) => setRows(rows.map((r, j) => (j === i ? { ...r, [k]: v } : r)));
+
+  async function save(e) {
+    e.preventDefault();
+    setBusy(true);
+    let done = 0;
+    try {
+      for (const r of rows) {
+        const u = ov.units.find((x) => x.id === r.id);
+        const was = start(u);
+        const details = ['resident_name', 'phone', 'monthly_fee'].some((k) => r[k] !== was[k]);
+        const balance = r.balance !== was.balance;
+        if (!details && !balance) continue;
+        if (details) await db.saveUnit(building.id, { ...u, ...r });
+        // After the fee, so the balance typed here is the balance that results.
+        if (balance) await db.setUnitBalance(u.id, Number(r.balance || 0));
+        done++;
+      }
+      changed();
+      toast(done ? t('n_saved', { n: done }) : t('nothing_changed'));
+      if (done) go('/units');
+    } catch (err) {
+      changed();
+      toast(errText(err), true);
+    }
+    setBusy(false);
+  }
+
+  return html`
+    <a class="back" href="#/units">‹ ${t('apartments')}</a>
+    <form onSubmit=${save}>
+      <div class="page-head">
+        <h1>${t('edit_all')}</h1>
+        <button class="btn primary" disabled=${busy}>${t('save_all')}</button>
+      </div>
+      <p class="muted small" style="margin-bottom:12px">${t('edit_all_hint')}</p>
+      <div class="card table-wrap">
+        <table class="grid-edit">
+          <thead>
+            <tr>
+              <th>${t('apartment')}</th><th>${t('resident_name')}</th><th>${t('phone')}</th>
+              <th>${t('monthly_fee')}</th><th>${t('balance_now')} (${building.currency})</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((r, i) => {
+              const u = ov.units[i];
+              return html`<tr>
+                <td><b><bdi>${u.label}</bdi></b></td>
+                <td><input maxlength="80" aria-label=${t('resident_name')} value=${r.resident_name} onInput=${(e) => set(i, 'resident_name', e.target.value)} /></td>
+                <td><input maxlength="30" dir="ltr" inputmode="tel" aria-label=${t('phone')} value=${r.phone} onInput=${(e) => set(i, 'phone', e.target.value)} /></td>
+                <td><input dir="ltr" inputmode="decimal" required pattern="[0-9]*[.]?[0-9]*" aria-label=${t('monthly_fee')} value=${r.monthly_fee}
+                  onInput=${(e) => set(i, 'monthly_fee', latinDigits(e.target.value))} /></td>
+                <td><input dir="ltr" pattern="-?[0-9]*[.]?[0-9]*" aria-label=${t('balance_now')} value=${r.balance}
+                  onInput=${(e) => set(i, 'balance', latinDigits(e.target.value))} /></td>
+              </tr>`;
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div class="actions" style="margin-top:14px"><button class="btn primary" disabled=${busy}>${t('save_all')}</button></div>
+    </form>
+  `;
+}
+
+function Units({ building, ov, onEdit, openEntry }) {
   const cur = building.currency;
   const [filter, setFilter] = useState('all');
   const [q, setQ] = useState('');
@@ -265,7 +351,11 @@ function Units({ building, ov, onEdit }) {
   return html`
     <div class="page-head">
       <h1>${t('apartments')} <span class="muted">(${ov.units.length})</span></h1>
-      <button class="btn" onClick=${() => onEdit({})}>${t('add_apartment')}</button>
+      <div class="actions">
+        <button class="btn" onClick=${() => openEntry({ kind: 'extra' })}>${t('add_extra')}</button>
+        <a class="btn" href="#/units/edit">${t('edit_all')}</a>
+        <button class="btn" onClick=${() => onEdit({})}>${t('add_apartment')}</button>
+      </div>
     </div>
     <div class="filters">
       <input type="search" placeholder=${t('search_apartment')} value=${q} onInput=${(e) => setQ(e.target.value)} />
@@ -296,6 +386,16 @@ function UnitDetail({ building, ov, id, openEntry, onEdit }) {
     }
   }
 
+  // WhatsApp chat with the resident, with their balance and the app link already typed in.
+  const wa =
+    u.phone &&
+    waLink(
+      u.phone,
+      t('wa_msg', {
+        apt: u.label, building: building.name, status: plain(owedText(u.dues + u.bills, cur)), link: residentLink(building.code),
+      }),
+    );
+
   return html`
     <a class="back" href="#/units">‹ ${t('apartments')}</a>
     <div class="page-head">
@@ -306,6 +406,7 @@ function UnitDetail({ building, ov, id, openEntry, onEdit }) {
         </p>
       </div>
       <div class="actions">
+        ${wa && html`<a class="btn small" href=${wa} target="_blank" rel="noopener">${t('whatsapp')}</a>`}
         <button class="btn small" onClick=${() => onEdit(u)}>${t('edit')}</button>
         <button class="btn small" onClick=${password}>${t('password')}</button>
       </div>
@@ -321,6 +422,7 @@ function UnitDetail({ building, ov, id, openEntry, onEdit }) {
       <button class="btn primary big" onClick=${() => openEntry({ kind: 'payment', unit_id: u.id })}>${t('record_payment')}</button>
       <button class="btn big" onClick=${() => openEntry({ kind: 'bill', unit_id: u.id })}>${t('add_bill')}</button>
       <button class="btn big" onClick=${() => openEntry({ kind: 'bill_payment', unit_id: u.id })}>${t('record_bill_payment')}</button>
+      <button class="btn big" onClick=${() => openEntry({ kind: 'extra', unit_id: u.id })}>${t('add_extra')}</button>
     </div>
 
     <div class="section">
@@ -344,12 +446,14 @@ function UnitForm({ building, unit, onClose }) {
   const isNew = !unit.id;
   const [f, setF] = useState({
     id: unit.id, label: unit.label ?? '', floor: unit.floor ?? '', resident_name: unit.resident_name ?? '',
-    phone: unit.phone ?? '', monthly_fee: String(unit.monthly_fee ?? 120), opening_balance: String(unit.opening_balance ?? 0),
+    phone: unit.phone ?? '', monthly_fee: String(unit.monthly_fee ?? 120), balance: asInput(unit.dues),
   });
   const set = (k) => (e) => setF({ ...f, [k]: typeof e === 'string' ? e : e.target.value });
 
   async function submit() {
-    await db.saveUnit(building.id, { ...f, label: latinDigits(f.label) });
+    const id = await db.saveUnit(building.id, { ...f, label: latinDigits(f.label) });
+    // Only when the balance was typed over: a changed fee alone must be allowed to move it.
+    if (f.balance !== asInput(unit.dues)) await db.setUnitBalance(id, Number(f.balance || 0));
     changed();
     toast(t('saved'));
     onClose();
@@ -379,11 +483,11 @@ function UnitForm({ building, unit, onClose }) {
       <label><span>${t('monthly_fee')} (${building.currency})</span>${numberInput(f.monthly_fee, set('monthly_fee'), { required: true })}</label>
       <p class="muted small">${t('fee_hint')}</p>
       <label>
-        <span>${t('opening_balance')} (${building.currency})</span>
-        <input dir="ltr" inputmode="text" value=${f.opening_balance} onInput=${(e) => set('opening_balance')(latinDigits(e.target.value))}
+        <span>${t('balance_now')} (${building.currency})</span>
+        <input dir="ltr" inputmode="text" value=${f.balance} onInput=${(e) => set('balance')(latinDigits(e.target.value))}
           pattern="-?[0-9]*[.]?[0-9]*" />
       </label>
-      <p class="muted small">${t('opening_hint')}</p>
+      <p class="muted small">${t('balance_now_hint')}</p>
       ${!isNew && html`<button type="button" class="btn danger" onClick=${remove}>${t('delete_apartment')}</button>`}
     <//>
   `;
@@ -704,6 +808,7 @@ export function ManagerApp({ building, buildings, session, refresh, showSheet })
   else {
     const common = { building, ov: ov.data, openEntry: setEntry, onEdit: setUnitEdit };
     if (!section) view = html`<${Home} ...${common} />`;
+    else if (section === 'units' && parts[1] === 'edit') view = html`<${BulkEdit} building=${building} ov=${ov.data} />`;
     else if (section === 'units' && parts[1]) view = html`<${UnitDetail} ...${common} id=${parts[1]} key=${parts[1]} />`;
     else if (section === 'units') view = html`<${Units} ...${common} />`;
     else if (section === 'money') view = html`<${Money} ...${common} />`;
