@@ -132,7 +132,7 @@ function balances(unit) {
   let bills = 0;
   for (const e of s.entries) {
     if (e.unit_id !== unit.id) continue;
-    if (e.kind === 'due') dues += e.amount;
+    if (e.kind === 'due' || e.kind === 'extra') dues += e.amount;
     else if (e.kind === 'payment') dues -= e.amount;
     else if (e.kind === 'bill') bills += e.amount;
     else if (e.kind === 'bill_payment') bills -= e.amount;
@@ -328,15 +328,34 @@ export default {
     const fields = {
       label, floor: u.floor === '' || u.floor == null ? null : Number(u.floor),
       resident_name: u.resident_name?.trim() ?? '', phone: u.phone?.trim() ?? '',
-      monthly_fee: Number(u.monthly_fee || 0), opening_balance: Number(u.opening_balance || 0),
+      monthly_fee: Number(u.monthly_fee || 0),
     };
-    if (u.id) Object.assign(s.units.find((x) => x.id === u.id), fields);
-    else {
+    let id = u.id;
+    if (id) {
+      const unit = s.units.find((x) => x.id === id);
+      // A changed fee also changes this month's charge; earlier months keep theirs.
+      if (unit.monthly_fee !== fields.monthly_fee) {
+        const now = monthStart(0);
+        if (fields.monthly_fee > 0) {
+          s.entries.forEach((e) => e.unit_id === id && e.kind === 'due' && e.month === now && (e.amount = fields.monthly_fee));
+        } else s.entries = s.entries.filter((e) => !(e.unit_id === id && e.kind === 'due' && e.month === now));
+      }
+      Object.assign(unit, fields);
+    } else {
+      id = uid();
       s.units.push({
-        id: uid(), building_id: buildingId, ...fields, charge_from: monthStart(0),
+        id, building_id: buildingId, ...fields, opening_balance: 0, charge_from: monthStart(0),
         sort: Math.max(0, ...s.units.map((x) => x.sort)) + 1, created_at: new Date().toISOString(),
       });
     }
+    save();
+    return id;
+  },
+  async setUnitBalance(unitId, target) {
+    requireManager();
+    const unit = s.units.find((u) => u.id === unitId);
+    chargeDues(unit.building_id);
+    unit.opening_balance = Number(unit.opening_balance) + (Number(target) - balances(unit).dues);
     save();
   },
   async deleteUnit(id) {
@@ -378,13 +397,18 @@ export default {
       .map(withLabel);
   },
   async addEntry(buildingId, e) {
+    await this.addEntries(buildingId, [e]);
+  },
+  async addEntries(buildingId, list) {
     requireManager();
-    if (!(Number(e.amount) > 0)) throw new Error('bad_input');
-    s.entries.push({
-      id: uid(), building_id: buildingId, unit_id: e.unit_id || null, kind: e.kind, amount: Number(e.amount),
-      entry_date: e.entry_date, month: null, category: e.category || null, note: e.note?.trim() || null,
-      created_at: new Date().toISOString(),
-    });
+    if (list.some((e) => !(Number(e.amount) > 0))) throw new Error('bad_input');
+    for (const e of list) {
+      s.entries.push({
+        id: uid(), building_id: buildingId, unit_id: e.unit_id || null, kind: e.kind, amount: Number(e.amount),
+        entry_date: e.entry_date, month: null, category: e.category || null, note: e.note?.trim() || null,
+        created_at: new Date().toISOString(),
+      });
+    }
     save();
   },
   async deleteEntry(id) {
