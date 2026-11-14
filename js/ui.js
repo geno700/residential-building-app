@@ -64,7 +64,38 @@ export function waLink(phone, text) {
 // Text without the invisible direction marks money() adds, for messages that leave the app.
 export const plain = (s) => String(s).split(LRI).join('').split(PDI).join('');
 
-export const appBase = () => config.appUrl || location.origin + location.pathname;
+// Hands the browser a file to save, e.g. a backup.
+export function downloadFile(name, text, type = 'application/json') {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// Loads a script from the CDN the first time it is needed (the PDF maker is large, so not at start-up).
+const scripts = {};
+export const loadScript = (src) =>
+  (scripts[src] ??= new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    el.onload = resolve;
+    el.onerror = () => {
+      delete scripts[src];
+      el.remove();
+      reject(new Error('no_connection'));
+    };
+    document.head.append(el);
+  }));
+
+// A date and time as people read it, e.g. "15 Nov 2026, 14:05".
+export const fmtDateTime = (iso) =>
+  new Date(iso).toLocaleString(locale(), { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+export const appBase =() => config.appUrl || location.origin + location.pathname;
 export const residentLink = (code) => `${appBase()}?b=${encodeURIComponent(code)}`;
 
 export function remember(key, value) {
