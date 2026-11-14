@@ -52,6 +52,18 @@ export const owedText = (v, cur) =>
   v > EPS ? t('owes', { n: money(v, cur) }) : v < -EPS ? t('advance', { n: money(-v, cur) }) : t('settled');
 export const owedClass = (v) => (v > EPS ? 'low' : v < -EPS ? 'in' : '');
 
+// WhatsApp chat link for a phone number, with a message already typed in. Null if the number is unusable.
+// Local numbers (starting with 0) get the country code from config.js.
+export function waLink(phone, text) {
+  let d = latinDigits(phone).replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  else if (d.startsWith('0')) d = (config.countryCode ?? '') + d.slice(1);
+  if (d.length < 8) return null;
+  return `https://wa.me/${d}${text ? '?text=' + encodeURIComponent(text) : ''}`;
+}
+// Text without the invisible direction marks money() adds, for messages that leave the app.
+export const plain = (s) => String(s).split(LRI).join('').split(PDI).join('');
+
 export const appBase = () => config.appUrl || location.origin + location.pathname;
 export const residentLink = (code) => `${appBase()}?b=${encodeURIComponent(code)}`;
 
