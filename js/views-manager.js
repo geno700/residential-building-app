@@ -5,7 +5,9 @@ import { t, LangButton } from './i18n.js';
 import {
   EXPENSE_CATS, BILL_CATS, STATUSES, money, fmtDate, today, latinDigits, errText, catLabel, owedText, owedClass,
   residentLink, remember, go, useRoute, toast, ask, Modal, changed, useLoad, EntryRow, Tile, Loading, waLink, plain,
+  downloadFile, fmtDateTime,
 } from './ui.js';
+import { Report } from './views-report.js';
 
 // A balance as typed into a field: no thousands separators, at most two decimals.
 const asInput = (n) => String(Math.round(Number(n ?? 0) * 100) / 100);
@@ -386,15 +388,30 @@ function UnitDetail({ building, ov, id, openEntry, onEdit }) {
     }
   }
 
-  // WhatsApp chat with the resident, with their balance and the app link already typed in.
-  const wa =
-    u.phone &&
+  // WhatsApp chat with the resident, with their balance and their login details already typed in.
+  const waFor = (pw) =>
     waLink(
       u.phone,
       t('wa_msg', {
         apt: u.label, building: building.name, status: plain(owedText(u.dues + u.bills, cur)), link: residentLink(building.code),
+        code: building.code, pw,
       }),
     );
+  const wa = u.phone && waFor(u.password ?? '');
+  // A password set before the app started keeping them cannot be read, so a new one is made to send.
+  async function sendNewPassword() {
+    if (!(await ask(t('wa_no_password', { n: u.label }), { ok: t('wa_new_password') }))) return;
+    try {
+      const pw = await db.setUnitPassword(u.id, '');
+      changed();
+      const url = waFor(pw);
+      const tab = window.open(url, '_blank');
+      if (tab) tab.opener = null;
+      else location.href = url;
+    } catch (err) {
+      toast(errText(err), true);
+    }
+  }
 
   return html`
     <a class="back" href="#/units">‹ ${t('apartments')}</a>
@@ -406,11 +423,18 @@ function UnitDetail({ building, ov, id, openEntry, onEdit }) {
         </p>
       </div>
       <div class="actions">
-        ${wa && html`<a class="btn small" href=${wa} target="_blank" rel="noopener">${t('whatsapp')}</a>`}
+        ${wa &&
+        (u.password
+          ? html`<a class="btn small" href=${wa} target="_blank" rel="noopener">${t('whatsapp')}</a>`
+          : html`<button class="btn small" onClick=${sendNewPassword}>${t('whatsapp')}</button>`)}
+        <a class="btn small" href=${'#/report/' + u.id}>${t('statement_pdf')}</a>
         <button class="btn small" onClick=${() => onEdit(u)}>${t('edit')}</button>
         <button class="btn small" onClick=${password}>${t('password')}</button>
       </div>
     </div>
+    ${u.password
+      ? html`<p class="small" style="margin-bottom:12px">${t('login_details')}: <bdi class="mono"><b>${u.label}</b></bdi> · ${t('password')}: <bdi class="mono"><b>${u.password}</b></bdi></p>`
+      : u.has_password && html`<p class="small muted" style="margin-bottom:12px">${t('password_hidden')}</p>`}
 
     <div class="tiles two">
       <${Tile} label=${t('fees')} value=${owedText(u.dues, cur)} alert=${u.dues > 0.004} good=${u.dues < -0.004} />
@@ -505,6 +529,7 @@ function Money({ building, ov, openEntry }) {
     <div class="page-head">
       <h1>${t('money')}</h1>
       <div class="actions">
+        <a class="btn" href="#/report">${t('report_pdf')}</a>
         <button class="btn" onClick=${() => openEntry({ kind: 'income' })}>${t('add_income')}</button>
         <button class="btn primary" onClick=${() => openEntry({ kind: 'expense' })}>${t('add_expense')}</button>
       </div>
@@ -649,6 +674,92 @@ function Managers({ building }) {
   `;
 }
 
+// Backups: a copy is saved automatically once a day; the manager can also save one, download it, or go back to one.
+function Backups({ building }) {
+  const list = useLoad(() => db.listBackups(building.id), [building.id]);
+  const [busy, setBusy] = useState(false);
+  const [all, setAll] = useState(false);
+
+  const save = (data) =>
+    downloadFile(`backup-${building.code}-${String(data.taken_at ?? '').slice(0, 10) || today()}.json`, JSON.stringify(data));
+  async function run(fn) {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (err) {
+      toast(errText(err), true);
+    }
+    setBusy(false);
+  }
+  const backupNow = () =>
+    run(async () => {
+      save(await db.backupNow(building.id));
+      list.reload();
+      toast(t('backup_saved'));
+    });
+  const download = (k) => run(async () => save(await db.getBackup(k.id)));
+
+  async function restore(source, info) {
+    const text = t('confirm_restore', { when: info.when ? fmtDateTime(info.when) : '?', units: info.units, entries: info.entries });
+    if (!(await ask(text, { ok: t('restore'), danger: true }))) return;
+    await run(async () => {
+      await db.restoreBackup(building.id, source);
+      await ask(t('restored'), { info: true });
+      location.reload();
+    });
+  }
+  async function fromFile(e) {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    let data = null;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      // Not a backup file: reported just below.
+    }
+    if (data?.app !== 'residential-building-app' || !Array.isArray(data.units) || !Array.isArray(data.entries)) {
+      return toast(t('err.bad_backup'), true);
+    }
+    restore({ data }, { when: data.taken_at, units: data.units.length, entries: data.entries.length });
+  }
+
+  const rows = list.data ? (all ? list.data : list.data.slice(0, 5)) : [];
+  return html`
+    <div class="card pad form section">
+      <h2>${t('backups')}</h2>
+      <p class="muted small">${t('backups_hint')}</p>
+      <div class="actions">
+        <button class="btn primary" disabled=${busy} onClick=${backupNow}>${t('backup_now')}</button>
+        <button class="btn" disabled=${busy} onClick=${(e) => e.currentTarget.nextElementSibling.click()}>${t('restore_file')}</button>
+        <input type="file" accept=".json,application/json" hidden onChange=${fromFile} />
+      </div>
+      ${list.data
+        ? html`<div class="list">
+            ${list.data.length === 0 && html`<p class="muted small">${t('no_backups')}</p>`}
+            ${rows.map(
+              (k) => html`
+                <div class="row" style="padding:10px 0">
+                  <div class="main">
+                    <div class="title"><bdi>${fmtDateTime(k.created_at)}</bdi></div>
+                    <div class="sub">${t('bk.' + k.kind)} · ${t('backup_counts', { units: k.units, entries: k.entries })}</div>
+                  </div>
+                  <div class="actions">
+                    <button class="btn small" disabled=${busy} onClick=${() => download(k)}>${t('download')}</button>
+                    <button class="btn small danger" disabled=${busy}
+                      onClick=${() => restore({ id: k.id }, { when: k.created_at, units: k.units, entries: k.entries })}>${t('restore')}</button>
+                  </div>
+                </div>
+              `,
+            )}
+            ${!all && list.data.length > rows.length &&
+            html`<button class="btn small" onClick=${() => setAll(true)}>${t('show_all_n', { n: list.data.length })}</button>`}
+          </div>`
+        : html`<${Loading} state=${list} />`}
+    </div>
+  `;
+}
+
 function Settings({ building, buildings, session, refresh, showSheet }) {
   const [f, setF] = useState({ name: building.name, currency: building.currency, opening_cash: String(building.opening_cash) });
   const [busy, setBusy] = useState(false);
@@ -758,6 +869,8 @@ function Settings({ building, buildings, session, refresh, showSheet }) {
       </div>
     </div>
 
+    <${Backups} building=${building} />
+
     <${Managers} building=${building} />
 
     <div class="card pad form section">
@@ -813,6 +926,7 @@ export function ManagerApp({ building, buildings, session, refresh, showSheet })
     else if (section === 'units') view = html`<${Units} ...${common} />`;
     else if (section === 'money') view = html`<${Money} ...${common} />`;
     else if (section === 'maintenance') view = html`<${Maintenance} building=${building} />`;
+    else if (section === 'report') view = html`<${Report} building=${building} ov=${ov.data} unitId=${parts[1]} key=${parts[1] ?? 'all'} />`;
     else if (section === 'settings') {
       view = html`<${Settings} building=${building} buildings=${buildings} session=${session} refresh=${refresh} showSheet=${showSheet} key=${building.id} />`;
     } else view = html`<p class="state">${t('not_found')} <a href="#/"><u>${t('home')}</u></a></p>`;
