@@ -64,6 +64,7 @@ create index if not exists resident_sessions_unit_idx on public.resident_session
 
 -- The ledger. Amounts are always positive; "kind" says what the money was.
 --   due          monthly fee charged to an apartment          (apartment owes the building)
+--   extra        one-time extra fee, e.g. an upgrade project  (apartment owes the building)
 --   payment      apartment paid fees                          (cash into the building fund)
 --   bill         manager paid a bill for an apartment         (apartment owes the manager)
 --   bill_payment apartment repaid the manager for bills
@@ -73,7 +74,7 @@ create table if not exists public.entries (
   id uuid primary key default gen_random_uuid(),
   building_id uuid not null references public.buildings (id) on delete cascade,
   unit_id uuid,
-  kind text not null check (kind in ('due', 'payment', 'bill', 'bill_payment', 'expense', 'income')),
+  kind text not null,
   amount numeric not null check (amount > 0),
   entry_date date not null default current_date,
   month date,
@@ -81,9 +82,18 @@ create table if not exists public.entries (
   note text,
   created_by uuid default auth.uid(),
   created_at timestamptz not null default now(),
-  foreign key (building_id, unit_id) references public.units (building_id, id) on delete cascade,
-  check ((kind in ('due', 'payment', 'bill', 'bill_payment')) = (unit_id is not null))
+  foreign key (building_id, unit_id) references public.units (building_id, id) on delete cascade
 );
+-- The allowed kinds, and which of them belong to an apartment. Replaced on every run so that
+-- an older database picks up new kinds.
+alter table public.entries drop constraint if exists entries_kind_check;
+alter table public.entries drop constraint if exists entries_check;
+alter table public.entries drop constraint if exists entries_kinds;
+alter table public.entries drop constraint if exists entries_unit_kinds;
+alter table public.entries add constraint entries_kinds
+  check (kind in ('due', 'extra', 'payment', 'bill', 'bill_payment', 'expense', 'income'));
+alter table public.entries add constraint entries_unit_kinds
+  check ((kind in ('due', 'extra', 'payment', 'bill', 'bill_payment')) = (unit_id is not null));
 create index if not exists entries_building_idx on public.entries (building_id, entry_date desc);
 create index if not exists entries_unit_idx on public.entries (unit_id);
 -- One monthly fee per apartment per month.
@@ -176,7 +186,7 @@ returns table (unit_id uuid, dues numeric, bills numeric)
 language sql stable set search_path = public as $$
   select u.id,
     u.opening_balance
-      + coalesce(sum(case e.kind when 'due' then e.amount when 'payment' then -e.amount else 0 end), 0),
+      + coalesce(sum(case e.kind when 'due' then e.amount when 'extra' then e.amount when 'payment' then -e.amount else 0 end), 0),
     coalesce(sum(case e.kind when 'bill' then e.amount when 'bill_payment' then -e.amount else 0 end), 0)
   from public.units u
   left join public.entries e on e.unit_id = u.id
@@ -284,6 +294,53 @@ begin
   delete from public.building_managers where building_id = p_building and user_id = p_user;
 end;
 $$;
+
+-- Make an apartment's fee balance exactly p_target right now (positive: it owes, negative: credit).
+-- The difference goes into its opening balance, so the statement still adds up.
+create or replace function public.set_unit_balance(p_unit uuid, p_target numeric) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_building uuid;
+  v_dues numeric;
+begin
+  select building_id into v_building from public.units where id = p_unit;
+  if v_building is null or not public.is_manager(v_building) then
+    raise exception 'not_allowed';
+  end if;
+  if p_target is null then
+    raise exception 'bad_input';
+  end if;
+  perform private.charge_dues(v_building);
+  select dues into v_dues from private.unit_balances(v_building) where unit_id = p_unit;
+  update public.units set opening_balance = opening_balance + (p_target - v_dues) where id = p_unit;
+end;
+$$;
+
+-- When an apartment's monthly fee changes, this month's charge follows it.
+-- Earlier months keep the amount they were charged.
+create or replace function public.units_sync_due() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  v_month date;
+begin
+  if new.monthly_fee is distinct from old.monthly_fee then
+    select date_trunc('month', now() at time zone b.timezone)::date into v_month
+    from public.buildings b where b.id = new.building_id;
+    if new.monthly_fee > 0 then
+      update public.entries set amount = new.monthly_fee
+      where unit_id = new.id and kind = 'due' and month = v_month;
+    else
+      delete from public.entries where unit_id = new.id and kind = 'due' and month = v_month;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists units_sync_due on public.units;
+create trigger units_sync_due
+  after update of monthly_fee on public.units
+  for each row execute function public.units_sync_due();
 
 -- Rename every apartment from its floor: coded (F1-R, F1-L ...) or numbered (1, 2, 3 ...).
 -- Apartments without a floor keep their name. Passwords and balances are not touched.
@@ -601,6 +658,9 @@ revoke all on public.unit_access, public.resident_sessions, public.building_mana
 -- Who may call what.
 revoke execute on function public.create_building(text, int, int, numeric, text, boolean) from public, anon;
 revoke execute on function public.relabel_units(uuid, boolean) from public, anon;
+revoke execute on function public.set_unit_balance(uuid, numeric) from public, anon;
+grant execute on function public.set_unit_balance(uuid, numeric) to authenticated;
+revoke execute on function public.units_sync_due() from public, anon, authenticated;
 revoke execute on function public.list_managers(uuid) from public, anon;
 revoke execute on function public.add_manager(uuid, text) from public, anon;
 revoke execute on function public.remove_manager(uuid, uuid) from public, anon;
