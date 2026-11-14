@@ -19,6 +19,45 @@ const CODE_KEY = 'building-fund-code';
   }
 }
 
+// Installable app: the service worker makes the site installable and usable on a bad connection.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+// Chrome and Android announce that the app can be installed; keep the event until the person asks.
+let installEvent = null;
+const installWatchers = new Set();
+addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installEvent = e;
+  installWatchers.forEach((cb) => cb());
+});
+addEventListener('appinstalled', () => {
+  installEvent = null;
+  installWatchers.forEach((cb) => cb());
+});
+
+function InstallHint() {
+  const [, redraw] = useState(0);
+  useEffect(() => {
+    const cb = () => redraw((n) => n + 1);
+    installWatchers.add(cb);
+    return () => installWatchers.delete(cb);
+  }, []);
+  const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  if (installed) return null;
+  if (installEvent) {
+    const install = async () => {
+      const e = installEvent;
+      installEvent = null;
+      redraw((n) => n + 1);
+      await e.prompt();
+    };
+    return html`<p class="switch"><button type="button" class="btn" onClick=${install}>${t('install_app')}</button></p>`;
+  }
+  // iPhone and iPad have no install button; it is done from the Share menu.
+  if (/iphone|ipad|ipod/i.test(navigator.userAgent)) return html`<p class="switch small">${t('install_ios')}</p>`;
+  return null;
+}
+
 function Brand() {
   return html`<div class="brand"><span class="brand-mark"></span><span class="brand-name">${config.appName}</span></div>`;
 }
@@ -126,6 +165,7 @@ function Login() {
       </div>
       ${tab === 'resident' ? html`<${ResidentLogin} />` : html`<${ManagerLogin} />`}
       <p class="switch"><${LangButton} /></p>
+      <${InstallHint} />
     </div>
   `;
 }
