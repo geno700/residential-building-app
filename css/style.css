@@ -247,7 +247,35 @@ td.num, th:not(:first-child) { text-align: end; }
   break-inside: avoid; display: grid; gap: 2px;
 }
 
+/* ---------- reports (PDF and print) ---------- */
+
+/* Always black on white, also in dark mode: this is what ends up on paper. */
+.paper-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+.paper {
+  --text: #111; --muted: #555; --border: #c4c4c4;
+  min-width: 640px; padding: 22px; background: #fff; color: #111; font-size: 0.9rem;
+}
+.paper-head { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 12px; border-bottom: 2px solid #111; }
+.paper-head h2 { margin: 0; font-size: 1.3rem; }
+.paper-title { margin-top: 2px; font-weight: 600; }
+.paper-when { text-align: end; font-size: 0.82rem; color: var(--muted); }
+.paper h3 { margin: 18px 0 8px; font-size: 1rem; }
+.facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+.paper h3 + .facts { margin-top: 0; }
+.fact { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.fact .label { font-size: 0.74rem; color: var(--muted); }
+.fact .value { font-weight: 700; font-variant-numeric: tabular-nums; }
+.paper table { font-size: 0.82rem; }
+.paper th, .paper td { padding: 5px 8px; border: 1px solid var(--border); }
+.paper th { background: #eee; color: #111; white-space: normal; text-align: center; }
+.filters input[type="date"] { width: auto; flex: 0 1 170px; }
+.paper td.wrap { white-space: normal; overflow-wrap: anywhere; }
+.paper tr { break-inside: avoid; }
+.paper tr.total td { font-weight: 700; background: #f4f4f4; }
+
 @media print {
+  .paper-wrap { overflow: visible; border: none; }
+  .paper { min-width: 0; padding: 0; }
   .topbar, .banner, .no-print, #toasts { display: none !important; }
   body { background: #fff; color: #000; }
   main { max-width: none; padding: 0; }
