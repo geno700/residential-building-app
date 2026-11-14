@@ -53,6 +53,9 @@ create table if not exists public.unit_access (
   failed int not null default 0,
   locked_until timestamptz
 );
+-- The password as the manager set it, so the manager can read it again and send it to the resident.
+-- Empty for passwords set before this column existed (they still work, but cannot be shown).
+alter table public.unit_access add column if not exists password text;
 
 create table if not exists public.resident_sessions (
   token_hash text primary key,
@@ -121,6 +124,20 @@ create table if not exists public.building_managers (
   primary key (building_id, user_id)
 );
 create index if not exists building_managers_user_idx on public.building_managers (user_id);
+
+-- Saved copies of a building's data. No access rules: read and written only through the functions below.
+--   auto            taken once a day when a manager opens the building
+--   manual          the manager pressed "Back up now"
+--   before_restore  taken automatically just before a restore, so a restore can be undone
+create table if not exists public.backups (
+  id uuid primary key default gen_random_uuid(),
+  building_id uuid not null references public.buildings (id) on delete cascade,
+  kind text not null default 'manual' check (kind in ('auto', 'manual', 'before_restore')),
+  created_at timestamptz not null default now(),
+  created_by uuid default auth.uid(),
+  data jsonb not null
+);
+create index if not exists backups_building_idx on public.backups (building_id, created_at desc);
 
 -- ---------------------------------------------------------------- private helpers
 
@@ -221,6 +238,63 @@ language sql stable set search_path = public as $$
   )
   from public.buildings b, money, owed
   where b.id = p_building;
+$$;
+
+-- Everything in a building as one document: the content of a backup.
+create or replace function private.snapshot(p_building uuid) returns jsonb
+language sql stable set search_path = public as $$
+  select jsonb_build_object(
+    'app', 'residential-building-app',
+    'version', 1,
+    'taken_at', now(),
+    'building', (
+      select jsonb_build_object('name', b.name, 'code', b.code, 'currency', b.currency, 'opening_cash', b.opening_cash)
+      from public.buildings b where b.id = p_building
+    ),
+    'units', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', u.id, 'label', u.label, 'floor', u.floor, 'resident_name', u.resident_name, 'phone', u.phone,
+        'monthly_fee', u.monthly_fee, 'opening_balance', u.opening_balance, 'charge_from', u.charge_from,
+        'sort', u.sort, 'created_at', u.created_at, 'password', a.password
+      ) order by u.sort, u.label)
+      from public.units u left join public.unit_access a on a.unit_id = u.id
+      where u.building_id = p_building
+    ), '[]'::jsonb),
+    'entries', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', e.id, 'unit_id', e.unit_id, 'kind', e.kind, 'amount', e.amount, 'entry_date', e.entry_date,
+        'month', e.month, 'category', e.category, 'note', e.note, 'created_at', e.created_at
+      ) order by e.created_at, e.id)
+      from public.entries e where e.building_id = p_building
+    ), '[]'::jsonb),
+    'maintenance', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', m.id, 'title', m.title, 'details', m.details, 'status', m.status, 'unit_id', m.unit_id,
+        'created_at', m.created_at, 'done_at', m.done_at
+      ) order by m.created_at, m.id)
+      from public.maintenance m where m.building_id = p_building
+    ), '[]'::jsonb)
+  );
+$$;
+
+-- Saves a backup and drops the oldest ones of the same kind (30 daily ones, 20 of the others).
+create or replace function private.save_backup(p_building uuid, p_kind text) returns uuid
+language plpgsql volatile set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  insert into public.backups (building_id, kind, data)
+  values (p_building, p_kind, private.snapshot(p_building))
+  returning id into v_id;
+  delete from public.backups
+  where building_id = p_building and kind = p_kind and id not in (
+    select id from public.backups
+    where building_id = p_building and kind = p_kind
+    order by created_at desc
+    limit case when p_kind = 'auto' then 30 else 20 end
+  );
+  return v_id;
+end;
 $$;
 
 -- ---------------------------------------------------------------- manager functions
@@ -370,7 +444,6 @@ end;
 $$;
 
 -- Start a building. Creates the apartments and a password for each one.
--- The passwords are returned once here and are never readable again (only replaceable).
 -- p_coded: name apartments F1-R, F1-L ... (true) or 1, 2, 3 ... (false).
 drop function if exists public.create_building(text, int, int, numeric, text);
 create or replace function public.create_building(
@@ -422,7 +495,7 @@ begin
       insert into public.units (building_id, label, floor, monthly_fee, sort)
       values (v_b.id, v_label, f, p_fee, v_n)
       returning id into v_unit;
-      insert into public.unit_access (unit_id, password_hash) values (v_unit, crypt(v_pw, gen_salt('bf')));
+      insert into public.unit_access (unit_id, password_hash, password) values (v_unit, crypt(v_pw, gen_salt('bf')), v_pw);
       v_list := v_list || jsonb_build_object('label', v_label, 'floor', f, 'password', v_pw);
     end loop;
   end loop;
@@ -447,8 +520,9 @@ begin
   elsif length(v_pw) < 4 then
     raise exception 'short_password';
   end if;
-  insert into public.unit_access (unit_id, password_hash) values (p_unit, crypt(v_pw, gen_salt('bf')))
-  on conflict (unit_id) do update set password_hash = excluded.password_hash, failed = 0, locked_until = null;
+  insert into public.unit_access (unit_id, password_hash, password) values (p_unit, crypt(v_pw, gen_salt('bf')), v_pw)
+  on conflict (unit_id) do update
+    set password_hash = excluded.password_hash, password = excluded.password, failed = 0, locked_until = null;
   delete from public.resident_sessions where unit_id = p_unit;
   return v_pw;
 end;
@@ -467,8 +541,9 @@ begin
   end if;
   for r in select id, label, floor from public.units where building_id = p_building order by sort, label loop
     v_pw := private.new_password();
-    insert into public.unit_access (unit_id, password_hash) values (r.id, crypt(v_pw, gen_salt('bf')))
-    on conflict (unit_id) do update set password_hash = excluded.password_hash, failed = 0, locked_until = null;
+    insert into public.unit_access (unit_id, password_hash, password) values (r.id, crypt(v_pw, gen_salt('bf')), v_pw)
+    on conflict (unit_id) do update
+      set password_hash = excluded.password_hash, password = excluded.password, failed = 0, locked_until = null;
     delete from public.resident_sessions where unit_id = r.id;
     v_list := v_list || jsonb_build_object('label', r.label, 'floor', r.floor, 'password', v_pw);
   end loop;
@@ -484,6 +559,17 @@ begin
     raise exception 'not_allowed';
   end if;
   perform private.charge_dues(p_building);
+  -- The daily automatic backup. A problem here must never stop the manager from opening the building.
+  begin
+    if not exists (
+      select 1 from public.backups
+      where building_id = p_building and kind = 'auto' and created_at > now() - interval '20 hours'
+    ) then
+      perform private.save_backup(p_building, 'auto');
+    end if;
+  exception when others then
+    null;
+  end;
   return jsonb_build_object(
     'summary', private.summary(p_building),
     'units', coalesce((
@@ -491,13 +577,150 @@ begin
         to_jsonb(u) || jsonb_build_object(
           'dues', b.dues,
           'bills', b.bills,
-          'has_password', exists (select 1 from public.unit_access a where a.unit_id = u.id)
+          'has_password', exists (select 1 from public.unit_access a where a.unit_id = u.id),
+          'password', (select a.password from public.unit_access a where a.unit_id = u.id)
         ) order by u.sort, u.label
       )
       from public.units u
       join private.unit_balances(p_building) b on b.unit_id = u.id
       where u.building_id = p_building
     ), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------- backups
+
+-- "Back up now": saves a copy in the database and returns it, so the app can also download it as a file.
+create or replace function public.backup_now(p_building uuid) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  if not public.is_manager(p_building) then
+    raise exception 'not_allowed';
+  end if;
+  v_id := private.save_backup(p_building, 'manual');
+  return (select data from public.backups where id = v_id);
+end;
+$$;
+
+-- The saved backups of a building, newest first, without their content.
+create or replace function public.list_backups(p_building uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_manager(p_building) then
+    raise exception 'not_allowed';
+  end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', k.id, 'kind', k.kind, 'created_at', k.created_at,
+      'units', jsonb_array_length(k.data -> 'units'), 'entries', jsonb_array_length(k.data -> 'entries')
+    ) order by k.created_at desc)
+    from public.backups k where k.building_id = p_building
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- The content of one saved backup, to download it.
+create or replace function public.get_backup(p_backup uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_building uuid;
+  v_data jsonb;
+begin
+  select building_id, data into v_building, v_data from public.backups where id = p_backup;
+  if v_building is null or not public.is_manager(v_building) then
+    raise exception 'not_allowed';
+  end if;
+  return v_data;
+end;
+$$;
+
+-- Put a building back to a backup: a saved one (p_backup) or the content of a downloaded file (p_data).
+-- Apartments, balances, the whole ledger and maintenance become what the backup holds.
+-- The current state is saved first as a "before_restore" backup, so this can be undone.
+-- Passwords of apartments that still exist are kept; managers and the building code never change.
+create or replace function public.restore_backup(p_building uuid, p_backup uuid default null, p_data jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v jsonb := p_data;
+begin
+  if not public.is_manager(p_building) then
+    raise exception 'not_allowed';
+  end if;
+  if p_backup is not null then
+    select data into v from public.backups where id = p_backup and building_id = p_building;
+  end if;
+  if v is null
+     or v ->> 'app' is distinct from 'residential-building-app'
+     or jsonb_typeof(v -> 'building') is distinct from 'object'
+     or jsonb_typeof(v -> 'units') is distinct from 'array'
+     or jsonb_typeof(v -> 'entries') is distinct from 'array'
+     or jsonb_array_length(v -> 'units') > 300 then
+    raise exception 'bad_backup';
+  end if;
+  -- A backup of another building that still exists would move its apartments here.
+  if exists (
+    select 1 from jsonb_to_recordset(v -> 'units') as x(id uuid)
+    join public.units u on u.id = x.id
+    where u.building_id <> p_building
+  ) then
+    raise exception 'backup_other_building';
+  end if;
+
+  perform private.save_backup(p_building, 'before_restore');
+
+  update public.buildings set
+    name = coalesce(nullif(trim(v -> 'building' ->> 'name'), ''), name),
+    currency = coalesce(nullif(trim(v -> 'building' ->> 'currency'), ''), currency),
+    opening_cash = coalesce((v -> 'building' ->> 'opening_cash')::numeric, opening_cash)
+  where id = p_building;
+
+  delete from public.entries where building_id = p_building;
+  delete from public.maintenance where building_id = p_building;
+  delete from public.units
+  where building_id = p_building and id not in (select x.id from jsonb_to_recordset(v -> 'units') as x(id uuid));
+  -- Free every name first, so a restored name never collides with one that is about to change.
+  update public.units set label = substr(md5(id::text), 1, 16) where building_id = p_building;
+
+  insert into public.units (id, building_id, label, floor, resident_name, phone, monthly_fee, opening_balance, charge_from, sort, created_at)
+  select x.id, p_building, x.label, x.floor, x.resident_name, x.phone, coalesce(x.monthly_fee, 0), coalesce(x.opening_balance, 0),
+    coalesce(x.charge_from, date_trunc('month', now())::date), coalesce(x.sort, 0), coalesce(x.created_at, now())
+  from jsonb_to_recordset(v -> 'units') as x(
+    id uuid, label text, floor int, resident_name text, phone text, monthly_fee numeric, opening_balance numeric,
+    charge_from date, sort int, created_at timestamptz)
+  on conflict (id) do update set
+    label = excluded.label, floor = excluded.floor, resident_name = excluded.resident_name, phone = excluded.phone,
+    monthly_fee = excluded.monthly_fee, opening_balance = excluded.opening_balance, charge_from = excluded.charge_from,
+    sort = excluded.sort;
+
+  -- Apartments that came back from the backup get the password they had, when the backup knows it.
+  insert into public.unit_access (unit_id, password_hash, password)
+  select x.id, crypt(x.password, gen_salt('bf')), x.password
+  from jsonb_to_recordset(v -> 'units') as x(id uuid, password text)
+  where length(coalesce(x.password, '')) >= 4
+    and not exists (select 1 from public.unit_access a where a.unit_id = x.id);
+
+  insert into public.entries (id, building_id, unit_id, kind, amount, entry_date, month, category, note, created_by, created_at)
+  select coalesce(x.id, gen_random_uuid()), p_building, x.unit_id, x.kind, x.amount, coalesce(x.entry_date, current_date),
+    x.month, x.category, x.note, null, coalesce(x.created_at, now())
+  from jsonb_to_recordset(v -> 'entries') as x(
+    id uuid, unit_id uuid, kind text, amount numeric, entry_date date, month date, category text, note text,
+    created_at timestamptz);
+
+  insert into public.maintenance (id, building_id, title, details, status, unit_id, created_at, done_at)
+  select coalesce(x.id, gen_random_uuid()), p_building, x.title, x.details, coalesce(x.status, 'open'),
+    (select u.id from public.units u where u.id = x.unit_id and u.building_id = p_building),
+    coalesce(x.created_at, now()), x.done_at
+  from jsonb_to_recordset(coalesce(v -> 'maintenance', '[]'::jsonb)) as x(
+    id uuid, title text, details text, status text, unit_id uuid, created_at timestamptz, done_at timestamptz);
+
+  return jsonb_build_object(
+    'units', jsonb_array_length(v -> 'units'),
+    'entries', jsonb_array_length(v -> 'entries'),
+    'taken_at', v ->> 'taken_at'
   );
 end;
 $$;
@@ -560,8 +783,8 @@ language sql security definer set search_path = public, extensions as $$
   delete from public.resident_sessions where token_hash = private.token_hash(p_token);
 $$;
 
--- Everything a resident may see: their own apartment and statement, and the building's money.
--- Other apartments' balances are never included.
+-- Everything a resident may see: their own apartment and statement, and the building fund's balance.
+-- Other apartments, the building's ledger and maintenance are never included.
 create or replace function public.resident_overview(p_token text) returns jsonb
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -592,35 +815,10 @@ begin
         order by entry_date desc, created_at desc limit 500
       ) x
     ), '[]'::jsonb),
-    'summary', private.summary(v_b.id),
-    'ledger', coalesce((
-      select jsonb_agg(to_jsonb(x) order by x.entry_date desc, x.created_at desc)
-      from (
-        select id, kind, amount, entry_date, category, note, created_at
-        from public.entries where building_id = v_b.id and kind in ('expense', 'income')
-        order by entry_date desc, created_at desc limit 300
-      ) x
-    ), '[]'::jsonb),
-    'months', coalesce((
-      select jsonb_agg(to_jsonb(x) order by x.month desc)
-      from (
-        select date_trunc('month', entry_date)::date as month,
-          coalesce(sum(amount) filter (where kind = 'payment'), 0) as collected,
-          coalesce(sum(amount) filter (where kind = 'income'), 0) as income,
-          coalesce(sum(amount) filter (where kind = 'expense'), 0) as spent
-        from public.entries
-        where building_id = v_b.id and kind in ('payment', 'income', 'expense')
-        group by 1 order by 1 desc limit 12
-      ) x
-    ), '[]'::jsonb),
-    'maintenance', coalesce((
-      select jsonb_agg(to_jsonb(x) order by x.created_at desc)
-      from (
-        select id, title, details, status, created_at, done_at, (unit_id = v_unit.id) as mine
-        from public.maintenance where building_id = v_b.id
-        order by created_at desc limit 100
-      ) x
-    ), '[]'::jsonb)
+    -- Of the building's money a resident sees one figure: what is in the fund now.
+    'summary', jsonb_build_object('cash', private.summary(v_b.id) -> 'cash'),
+    -- Always empty: only here so a phone still running an older copy of the app keeps working.
+    'ledger', '[]'::jsonb, 'months', '[]'::jsonb, 'maintenance', '[]'::jsonb
   );
 end;
 $$;
@@ -653,7 +851,7 @@ grant select, delete on public.buildings to authenticated;
 -- Managers may change a building's name, currency and opening balance, but not its code or owner.
 revoke update on public.buildings from anon, authenticated;
 grant update (name, currency, opening_cash) on public.buildings to authenticated;
-revoke all on public.unit_access, public.resident_sessions, public.building_managers from anon, authenticated;
+revoke all on public.unit_access, public.resident_sessions, public.building_managers, public.backups from anon, authenticated;
 
 -- Who may call what.
 revoke execute on function public.create_building(text, int, int, numeric, text, boolean) from public, anon;
@@ -669,6 +867,14 @@ grant execute on function public.list_managers(uuid) to authenticated;
 grant execute on function public.add_manager(uuid, text) to authenticated;
 grant execute on function public.remove_manager(uuid, uuid) to authenticated;
 grant execute on function public.is_owner(uuid) to anon, authenticated;
+revoke execute on function public.backup_now(uuid) from public, anon;
+revoke execute on function public.list_backups(uuid) from public, anon;
+revoke execute on function public.get_backup(uuid) from public, anon;
+revoke execute on function public.restore_backup(uuid, uuid, jsonb) from public, anon;
+grant execute on function public.backup_now(uuid) to authenticated;
+grant execute on function public.list_backups(uuid) to authenticated;
+grant execute on function public.get_backup(uuid) to authenticated;
+grant execute on function public.restore_backup(uuid, uuid, jsonb) to authenticated;
 revoke execute on function public.set_unit_password(uuid, text) from public, anon;
 revoke execute on function public.reset_all_passwords(uuid) from public, anon;
 revoke execute on function public.manager_overview(uuid) from public, anon;
@@ -693,6 +899,7 @@ alter table public.resident_sessions enable row level security;
 alter table public.entries enable row level security;
 alter table public.maintenance enable row level security;
 alter table public.building_managers enable row level security;
+alter table public.backups enable row level security;
 
 do $$
 declare r record;
