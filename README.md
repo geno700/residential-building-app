@@ -29,8 +29,7 @@ Arabic and English. Anyone can register their own building; each building's data
 **Each apartment** (building code + apartment number + password):
 
 - Sees what it owes or has paid in advance, with a full statement.
-- Sees one figure about the building: the balance of the building fund.
-- Does **not** see other apartments' balances or the building's expenses.
+- Does **not** see the building fund, the building's expenses or other apartments' balances.
 
 ## Try it on this PC
 
@@ -102,7 +101,7 @@ A new fee applies from the next month; months already charged keep their amount.
 - Apartment passwords are checked against a hash, and are also kept readable for the building's managers so they can send them to residents. Residents cannot read or change them. Backup files contain these passwords, so keep the files private.
 - Backups are stored in the same database. Download a backup file now and then to have a copy outside it.
 - Five wrong passwords lock an apartment's sign-in for 15 minutes.
-- Residents have no direct access to the database tables. Everything they see comes from one function that returns only their own apartment and the building fund's balance.
+- Residents have no direct access to the database tables. Everything they see comes from one function that returns only their own apartment.
 - Whoever runs the Supabase project can read every building's data in it. If that matters to you, run your own copy.
 
 ## Notes
