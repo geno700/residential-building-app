@@ -532,8 +532,6 @@ export default {
         opening_balance: unit.opening_balance, ...balances(unit),
       },
       statement: mine.filter((e) => e.unit_id === unit.id).sort(byDateDesc),
-      // Of the building's money a resident sees one figure: what is in the fund now.
-      summary: { cash: summary(b.id).cash },
     };
   },
 };
