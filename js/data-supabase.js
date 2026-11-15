@@ -296,7 +296,6 @@ export default {
     return {
       building: data.building,
       unit: flatUnit(data.unit),
-      summary: flatSummary(data.summary),
       statement: (data.statement ?? []).map(flatEntry),
     };
   },
