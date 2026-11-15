@@ -1,5 +1,5 @@
-// Resident screen: one page with their own apartment, balance and statement,
-// plus a single figure about the building: what is in the fund now.
+// Resident screen: one page with their own apartment, balance and statement.
+// Nothing about the building's money or other apartments.
 import { html } from './lib.js';
 import { db } from './data.js';
 import { t, LangButton } from './i18n.js';
@@ -28,9 +28,6 @@ function Mine({ d }) {
     <div class="tiles two" style="margin-top:12px">
       <${Tile} label=${t('fees')} value=${owedText(u.dues, cur)} alert=${u.dues > 0.004} good=${u.dues < -0.004} />
       <${Tile} label=${t('bills_paid_for_you')} value=${owedText(u.bills, cur)} alert=${u.bills > 0.004} />
-    </div>
-    <div class="tiles two" style="margin-top:12px;grid-template-columns:1fr">
-      <${Tile} label=${t('building_balance')} value=${money(d.summary.cash, cur)} alert=${d.summary.cash < 0} />
     </div>
 
     <div class="section">
