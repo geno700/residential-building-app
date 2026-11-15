@@ -783,8 +783,8 @@ language sql security definer set search_path = public, extensions as $$
   delete from public.resident_sessions where token_hash = private.token_hash(p_token);
 $$;
 
--- Everything a resident may see: their own apartment and statement, and the building fund's balance.
--- Other apartments, the building's ledger and maintenance are never included.
+-- Everything a resident may see: their own apartment, balance and statement.
+-- Other apartments, the building's money and maintenance are never included.
 create or replace function public.resident_overview(p_token text) returns jsonb
 language plpgsql security definer set search_path = public, extensions as $$
 declare
@@ -815,10 +815,9 @@ begin
         order by entry_date desc, created_at desc limit 500
       ) x
     ), '[]'::jsonb),
-    -- Of the building's money a resident sees one figure: what is in the fund now.
-    'summary', jsonb_build_object('cash', private.summary(v_b.id) -> 'cash'),
     -- Always empty: only here so a phone still running an older copy of the app keeps working.
-    'ledger', '[]'::jsonb, 'months', '[]'::jsonb, 'maintenance', '[]'::jsonb
+    -- A resident gets nothing about the building's money.
+    'summary', '{}'::jsonb, 'ledger', '[]'::jsonb, 'months', '[]'::jsonb, 'maintenance', '[]'::jsonb
   );
 end;
 $$;
