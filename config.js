@@ -6,7 +6,7 @@ export const config = {
   supabaseAnonKey: 'sb_publishable_M7QzNvmL2Tto6-QnkTr0rQ_-Y0ueJok',
   // Public address of the app, e.g. 'https://your-name.github.io/residential-building-app/'.
   // Used for the link residents open. Leave empty to use the address the app is opened from.
-  appUrl: 'https://geno700.github.io/residential-building-app/',
+  appUrl: 'https://algebratronics.com/residential-building-app/',
   appName: 'Residential Building App',
   // Country calling code added to local phone numbers for WhatsApp links (20 = Egypt).
   countryCode: '20',
