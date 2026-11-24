@@ -20,13 +20,21 @@ create table if not exists public.buildings (
   id uuid primary key default gen_random_uuid(),
   name text not null check (length(trim(name)) between 1 and 80),
   code text not null unique,
-  manager_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  -- restrict: deleting the manager's login must never delete the building (see the fix below).
+  manager_id uuid not null default auth.uid() references auth.users (id) on delete restrict,
   currency text not null default 'EGP' check (length(currency) <= 8),
   -- Money already in the building fund before the app was used.
   opening_cash numeric not null default 0,
   timezone text not null default 'Africa/Cairo',
   created_at timestamptz not null default now()
 );
+
+-- Databases created before 2026-11-25 had "on delete cascade" here, so deleting a manager's
+-- account deleted the building with all its apartments, entries and backups. Switch them to restrict.
+alter table public.buildings drop constraint if exists buildings_manager_id_fkey;
+alter table public.buildings
+  add constraint buildings_manager_id_fkey
+  foreign key (manager_id) references auth.users (id) on delete restrict;
 
 create table if not exists public.units (
   id uuid primary key default gen_random_uuid(),
