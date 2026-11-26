@@ -61,8 +61,8 @@ create table if not exists public.unit_access (
   failed int not null default 0,
   locked_until timestamptz
 );
--- The password as the manager set it, so the manager can read it again and send it to the resident.
--- Empty for passwords set before this column existed (they still work, but cannot be shown).
+-- Old column: readable copies of passwords. Since 26 Nov 2026 the app never stores them (a password is shown
+-- once, when it is made); kept only so older installs upgrade cleanly. It should always be empty.
 alter table public.unit_access add column if not exists password text;
 
 create table if not exists public.resident_sessions (
@@ -263,7 +263,7 @@ language sql stable set search_path = public as $$
       select jsonb_agg(jsonb_build_object(
         'id', u.id, 'label', u.label, 'floor', u.floor, 'resident_name', u.resident_name, 'phone', u.phone,
         'monthly_fee', u.monthly_fee, 'opening_balance', u.opening_balance, 'charge_from', u.charge_from,
-        'sort', u.sort, 'created_at', u.created_at, 'password', a.password
+        'sort', u.sort, 'created_at', u.created_at
       ) order by u.sort, u.label)
       from public.units u left join public.unit_access a on a.unit_id = u.id
       where u.building_id = p_building
@@ -503,7 +503,7 @@ begin
       insert into public.units (building_id, label, floor, monthly_fee, sort)
       values (v_b.id, v_label, f, p_fee, v_n)
       returning id into v_unit;
-      insert into public.unit_access (unit_id, password_hash, password) values (v_unit, crypt(v_pw, gen_salt('bf')), v_pw);
+      insert into public.unit_access (unit_id, password_hash) values (v_unit, crypt(v_pw, gen_salt('bf')));
       v_list := v_list || jsonb_build_object('label', v_label, 'floor', f, 'password', v_pw);
     end loop;
   end loop;
@@ -528,9 +528,9 @@ begin
   elsif length(v_pw) < 4 then
     raise exception 'short_password';
   end if;
-  insert into public.unit_access (unit_id, password_hash, password) values (p_unit, crypt(v_pw, gen_salt('bf')), v_pw)
+  insert into public.unit_access (unit_id, password_hash) values (p_unit, crypt(v_pw, gen_salt('bf')))
   on conflict (unit_id) do update
-    set password_hash = excluded.password_hash, password = excluded.password, failed = 0, locked_until = null;
+    set password_hash = excluded.password_hash, password = null, failed = 0, locked_until = null;
   delete from public.resident_sessions where unit_id = p_unit;
   return v_pw;
 end;
@@ -549,9 +549,9 @@ begin
   end if;
   for r in select id, label, floor from public.units where building_id = p_building order by sort, label loop
     v_pw := private.new_password();
-    insert into public.unit_access (unit_id, password_hash, password) values (r.id, crypt(v_pw, gen_salt('bf')), v_pw)
+    insert into public.unit_access (unit_id, password_hash) values (r.id, crypt(v_pw, gen_salt('bf')))
     on conflict (unit_id) do update
-      set password_hash = excluded.password_hash, password = excluded.password, failed = 0, locked_until = null;
+      set password_hash = excluded.password_hash, password = null, failed = 0, locked_until = null;
     delete from public.resident_sessions where unit_id = r.id;
     v_list := v_list || jsonb_build_object('label', r.label, 'floor', r.floor, 'password', v_pw);
   end loop;
@@ -704,9 +704,9 @@ begin
     monthly_fee = excluded.monthly_fee, opening_balance = excluded.opening_balance, charge_from = excluded.charge_from,
     sort = excluded.sort;
 
-  -- Apartments that came back from the backup get the password they had, when the backup knows it.
-  insert into public.unit_access (unit_id, password_hash, password)
-  select x.id, crypt(x.password, gen_salt('bf')), x.password
+  -- Apartments that came back from an older backup that still holds passwords get them back (stored as a hash only).
+  insert into public.unit_access (unit_id, password_hash)
+  select x.id, crypt(x.password, gen_salt('bf'))
   from jsonb_to_recordset(v -> 'units') as x(id uuid, password text)
   where length(coalesce(x.password, '')) >= 4
     and not exists (select 1 from public.unit_access a where a.unit_id = x.id);

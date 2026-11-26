@@ -19,7 +19,7 @@ Arabic and English. Anyone can register their own building; each building's data
 - Sets each apartment's balance to the real figure at any time (**Apartments > Edit all** does it for every apartment in one table).
 - Adds one-time extra fees, for one apartment or all of them, for example for an upgrade project.
 - Keeps a maintenance list.
-- Is the only one who can set, read or replace apartment passwords.
+- Is the only one who can set or replace apartment passwords. For security, a password is shown only once, when it is made; it is stored only as a hash.
 - Sends a resident their balance and sign-in details by WhatsApp, from the apartment's page.
 - Saves a building report or an apartment's statement as a PDF.
 - Backs up and restores the building: a copy is saved automatically once a day, and **Settings > Backup and restore** downloads a backup file or goes back to an earlier copy.
@@ -78,7 +78,7 @@ so either set up your own sender (**Authentication > Emails > SMTP settings**) o
 ### 4. Set up your building
 
 1. Open the app, choose **Manager**, create an account and sign in.
-2. Fill in the building form. The next page lists every apartment's password. Each password is also shown on its apartment's page.
+2. Fill in the building form. The next page lists every apartment's password, **once**: print it or write it down. To give a resident their password again later, set a new one on the apartment's page.
 3. In **Settings**, copy the resident link and send it to the residents with their passwords.
 4. In **Apartments**, set each apartment's fee, resident name and opening balance.
 5. In **Settings**, enter the money that is already in the building fund.
