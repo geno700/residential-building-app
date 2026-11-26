@@ -952,3 +952,11 @@ create policy "manager edits maintenance" on public.maintenance for update to au
   using (public.is_manager(building_id)) with check (public.is_manager(building_id));
 create policy "manager deletes maintenance" on public.maintenance for delete to authenticated
   using (public.is_manager(building_id));
+
+-- ---------------------------------------------------------------- security hardening (26 Nov 2026)
+-- Helpers used by RLS policies: signed-in users only. Internal helpers: only called from trusted functions.
+revoke execute on function public.is_manager(uuid), public.is_owner(uuid) from public, anon;
+grant execute on function public.is_manager(uuid), public.is_owner(uuid) to authenticated, service_role;
+revoke execute on function private.loose(text), private.unit_label(integer, integer, integer) from public, anon, authenticated;
+alter function private.loose(text) set search_path = '';
+alter function private.unit_label(integer, integer, integer) set search_path = '';
